@@ -1,7 +1,8 @@
 import { Platform } from "obsidian";
-import { PROTOCOL_VERSION, type DeviceStartRequest, type DeviceStartResponse, type DevicePollResponse, type MeResponse } from "@websync/shared";
+import { PROTOCOL_VERSION, type DeviceStartRequest, type DeviceStartResponse, type DevicePollResponse, type HealthResponse, type MeResponse } from "@websync/shared";
 import { t } from "../i18n";
 import { apiRequest } from "./httpClient.js";
+import { evaluateCompat } from "./compat.js";
 
 /**
  * Wraps the /auth/* endpoints. Holds no session state itself - the caller
@@ -29,10 +30,11 @@ export class AuthClient {
    * confusing ways. A server that does not report a version (older hosted builds) is let through.
    */
   async assertCompatibleServer(): Promise<void> {
-    const health = await apiRequest<{ protocolVersion?: number } | undefined>(this.serverUrl, { path: "/health" });
+    const health = await apiRequest<Partial<HealthResponse> | undefined>(this.serverUrl, { path: "/health" });
     const server = health?.protocolVersion;
-    if (server === undefined || server === PROTOCOL_VERSION) return;
-    const which = server > PROTOCOL_VERSION ? t("p.protocolPlugin") : t("p.protocolServer");
+    const { state } = evaluateCompat(health, "0.0.0");
+    if (server === undefined || state === "ok") return;
+    const which = state === "plugin-outdated" ? t("p.protocolPlugin") : t("p.protocolServer");
     throw new Error(t("p.protocolMismatch", { server, plugin: PROTOCOL_VERSION, which }));
   }
 

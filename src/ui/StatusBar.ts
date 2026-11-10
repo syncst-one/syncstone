@@ -10,9 +10,14 @@ import { t } from "../i18n/index.js";
 import { type App, Menu, Notice } from "obsidian";
 import type SyncstonePlugin from "../main.js";
 import { openExternal } from "../openExternal.js";
+import { RELEASES_URL } from "../sync/compat.js";
 
 export type Status =
   | { kind: "not-configured" }
+  /** The server needs a newer plugin: sync pauses until the plugin is updated. */
+  | { kind: "plugin-outdated" }
+  /** The plugin needs a newer server (self-hosted): sync pauses until the server is updated. */
+  | { kind: "server-outdated" }
   | { kind: "locked" }
   /** The server refuses changes: the storage quota is used up. */
   | { kind: "storage-full" }
@@ -52,6 +57,8 @@ export class SyncstoneStatusBar {
     const { settings, syncEngine, liveSyncConnected } = this.plugin;
 
     if (!settings.sessionToken || !settings.linkedVault) return { kind: "not-configured" };
+    const compat = this.plugin.compat.state;
+    if (compat !== "ok") return { kind: compat };
     if (!this.plugin.cryptoService.isUnlocked()) return { kind: "locked" };
     const account = this.plugin.account;
     if (account?.readOnly) return { kind: "read-only" };
@@ -67,6 +74,24 @@ export class SyncstoneStatusBar {
     const status = this.computeStatus();
     const menu = new Menu();
     prepend?.(menu);
+
+    if (status.kind === "plugin-outdated" || this.plugin.compat.updateAvailable) {
+      menu.addItem((item) =>
+        item
+          .setTitle(t("p.update.open"))
+          .setIcon("circle-arrow-up")
+          .onClick(() => this.openCommunityPlugins()),
+      );
+    }
+    if (status.kind === "plugin-outdated" || status.kind === "server-outdated" || this.plugin.compat.updateAvailable) {
+      menu.addItem((item) =>
+        item
+          .setTitle(t("p.update.whatsNew"))
+          .setIcon("external-link")
+          .onClick(() => openExternal(RELEASES_URL)),
+      );
+      menu.addSeparator();
+    }
 
     menu.addItem((item) =>
       item
@@ -134,6 +159,13 @@ export class SyncstoneStatusBar {
     menu.showAtMouseEvent(evt);
   }
 
+  /** Obsidian's community plugins page, where the update is installed. */
+  openCommunityPlugins(): void {
+    const app = this.plugin.app as AppWithSettingTab;
+    app.setting.open();
+    app.setting.openTabById("community-plugins");
+  }
+
   private async togglePaused(): Promise<void> {
     this.plugin.settings.syncPaused = !this.plugin.settings.syncPaused;
     await this.plugin.saveSettings();
@@ -152,8 +184,12 @@ export class SyncstoneStatusBar {
 export function describeStatus(
   status: Status,
   lastSyncAt: string | null,
-): { icon: string; text: string; tooltip: string; spin: boolean; alert?: boolean } {
+): { icon: string; text: string; tooltip: string; spin: boolean; alert?: boolean; warn?: boolean } {
   switch (status.kind) {
+    case "plugin-outdated":
+      return { icon: "circle-arrow-up", text: "Syncstone", tooltip: t("p.tip.pluginOutdated"), spin: false, warn: true };
+    case "server-outdated":
+      return { icon: "circle-arrow-up", text: "Syncstone", tooltip: t("p.tip.serverOutdated"), spin: false, warn: true };
     case "not-configured":
       return {
         icon: "cloud-off",

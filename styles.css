@@ -81,6 +81,11 @@
   color: var(--text-error);
 }
 
+/* An update is needed (plugin or self-hosted server): yellow, not red, nothing is broken or lost. */
+.syncstone-status-icon-warn {
+  color: var(--color-yellow);
+}
+
 .syncstone-storage-bar {
   height: 4px;
   margin-top: 8px;

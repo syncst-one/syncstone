@@ -102,7 +102,7 @@ export class SyncstoneHeaderActions {
     const presence = this.presenceOf(view);
     const status = this.statusBar.computeStatus();
     const described = describeStatus(status, this.plugin.settings.lastSyncAt);
-    const signature = JSON.stringify([described.icon, described.spin, described.alert ?? false, described.tooltip, presence]);
+    const signature = JSON.stringify([described.icon, described.spin, described.alert ?? false, described.warn ?? false, described.tooltip, presence]);
     if (signature === action.signature) return;
     action.signature = signature;
 
@@ -113,6 +113,7 @@ export class SyncstoneHeaderActions {
     setIcon(iconEl, described.icon);
     iconEl.toggleClass("syncstone-status-icon-spin", described.spin);
     iconEl.toggleClass("syncstone-status-icon-alert", described.alert ?? false);
+    iconEl.toggleClass("syncstone-status-icon-warn", described.warn ?? false);
 
     let tooltip = described.tooltip;
     if (presence && presence.length > 0) {

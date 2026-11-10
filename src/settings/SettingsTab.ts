@@ -9,6 +9,7 @@ import { SyncstoneApiError } from "../sync/httpClient.js";
 import { formatBytes } from "../ui/historyFormat.js";
 import { HOSTED_SERVER_URL, normalizeServerUrl } from "../hosted.js";
 import { openExternal } from "../openExternal.js";
+import { RELEASES_URL } from "../sync/compat.js";
 
 type PairingState = "idle" | "starting" | "waiting" | "denied" | "expired" | "error";
 
@@ -116,6 +117,7 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
     setIcon(status.createSpan({ cls: `syncstone-status-icon is-${tone}` }), icon);
     status.createSpan({ cls: "syncstone-status-text", text });
     if (settings.accountUsername && settings.sessionToken) status.createSpan({ cls: "syncstone-status-account", text: settings.accountUsername });
+    this.renderUpdateInfo(parent);
 
     // "Not now" on the backup notice: sync stays off until it is confirmed here (or in the status menu).
     if (!settings.backupAcknowledged) {
@@ -129,6 +131,39 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
             .onClick(() => void this.plugin.acknowledgeBackup()),
         );
     }
+  }
+
+  /** A newer plugin is out, or plugin and server do not fit together: said at the very top, with the way out. */
+  private renderUpdateInfo(parent: HTMLElement): void {
+    const { state, updateAvailable } = this.plugin.compat;
+    if (state === "ok" && !updateAvailable) return;
+    const installed = t("p.update.installed", { version: this.plugin.manifest.version });
+    let name: string;
+    let desc: string;
+    if (state === "plugin-outdated") {
+      name = t("p.update.requiredTitle");
+      desc = t("p.update.required");
+    } else if (state === "server-outdated") {
+      name = t("p.update.serverTitle");
+      desc = this.plugin.isSelfHosted() ? t("p.update.serverOutdated") : t("p.update.serverBusy");
+    } else {
+      name = t("p.update.availableTitle", { version: updateAvailable ?? "" });
+      desc = t("p.update.availableDesc");
+    }
+    const setting = new Setting(parent).setName(name).setDesc(`${desc} ${installed}`);
+    setting.settingEl.addClass("syncstone-update-info");
+    if (state !== "server-outdated") {
+      setting.addButton((btn) =>
+        btn
+          .setButtonText(t("p.update.open"))
+          .setCta()
+          .onClick(() => {
+            const app = this.app as unknown as { setting: { openTabById(id: string): void } };
+            app.setting.openTabById("community-plugins");
+          }),
+      );
+    }
+    setting.addButton((btn) => btn.setButtonText(t("p.update.whatsNew")).onClick(() => openExternal(RELEASES_URL)));
   }
 
   /**

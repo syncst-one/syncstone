@@ -78,7 +78,12 @@ export const TRANSFER_PROGRESS_DELAY_MS = 250;
 export const TRANSFER_QUEUED_DELAY_MS = 3000;
 
 /**
- * Version of the wire protocol / crypto format the plugin and the server must agree on. Bump it on every change that
- * an older plugin cannot cope with; the server reports it on `/health` and the plugin refuses to sync on a mismatch.
+ * Protocol level of the wire protocol / crypto format. Bump it only for a change that an older counterpart cannot cope
+ * with (additions that old clients simply ignore do not count). The server reports it on `/health`. Keep it identical in
+ * the hosted repository, the self-host repository and the plugin's copy of this package.
  */
 export const PROTOCOL_VERSION = 1;
+/** Lowest plugin protocol level the server still serves; an older plugin is told to update and pauses its sync. */
+export const MIN_CLIENT_PROTOCOL_VERSION = 1;
+/** Lowest server protocol level the plugin works with; with an older (self-hosted) server it asks for a server update. */
+export const MIN_SERVER_PROTOCOL_VERSION = 1;

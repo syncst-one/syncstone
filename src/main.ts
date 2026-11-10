@@ -1,12 +1,13 @@
 import { MarkdownView, normalizePath, Notice, Plugin, TFile } from "obsidian";
 import { applyHistoryTexts, t } from "./i18n";
-import { REMOTE_POLL_INTERVAL_MS, toBase64, unpackBlob, type MeResponse } from "@websync/shared";
+import { REMOTE_POLL_INTERVAL_MS, toBase64, unpackBlob, type HealthResponse, type MeResponse } from "@websync/shared";
 import { DEFAULT_SETTINGS, type SyncstoneSettings } from "./types.js";
 import { HOSTED_SERVER_URL, normalizeServerUrl } from "./hosted.js";
 import { AuthClient } from "./sync/AuthClient.js";
 import { RemoteApiClient } from "./sync/RemoteApiClient.js";
 import type { BillingInfo } from "./sync/billing.js";
-import { SyncstoneApiError } from "./sync/httpClient.js";
+import { SyncstoneApiError, apiRequest } from "./sync/httpClient.js";
+import { COMPAT_UNKNOWN, evaluateCompat, type CompatInfo } from "./sync/compat.js";
 import { CryptoService } from "./sync/CryptoService.js";
 import { VaultLinkManager } from "./sync/VaultLinkManager.js";
 import { FileSystemAdapter } from "./sync/FileSystemAdapter.js";
@@ -64,6 +65,10 @@ export default class SyncstonePlugin extends Plugin {
   /** What the sync did (the "Sync log" dialog); lives as long as the plugin, across unlink / relink. */
   syncLog!: SyncLog;
   private progressRings!: ExplorerProgressRings;
+  /** Whether plugin and server fit together, and whether a newer plugin is out (see checkCompat). */
+  compat: CompatInfo = COMPAT_UNKNOWN;
+  /** The last compat result that was shown to the user, so the same hint is not repeated within one Obsidian start. */
+  private compatAnnounced = "ok|";
 
   async onload(): Promise<void> {
     applyHistoryTexts(); // the change log (shared with the web app) speaks Obsidian's language
@@ -162,8 +167,13 @@ export default class SyncstonePlugin extends Plugin {
     this.app.workspace.onLayoutReady(() => {
       // Right after the installation: the backup notice comes before anything else.
       if (!this.settings.backupAcknowledged) this.showBackupNotice();
-      void this.tryStartSync();
+      void this.tryStartSync().then(() => {
+        // Not signed in: tryStartSync did not ask the server, but a newer plugin version is still worth a hint.
+        if (!this.settings.sessionToken || !this.settings.linkedVault) void this.checkCompat();
+      });
     });
+    // An updated server (or one that now needs a newer plugin) takes effect without restarting Obsidian.
+    this.registerInterval(window.setInterval(() => void this.recheckCompat(), 30 * 60 * 1000));
   }
 
   private backupNoticeOpen = false;
@@ -316,9 +326,57 @@ export default class SyncstonePlugin extends Plugin {
    * link/unlink, and unlock actions from the settings tab. Safe to call
    * repeatedly - always stops any previous engine first.
    */
+  /**
+   * Asks the server (`/health`) whether this plugin and the server fit together and whether a newer plugin is out. An
+   * unreachable server changes nothing: being offline is no reason to stop. Returns the (possibly unchanged) result.
+   */
+  async checkCompat(): Promise<CompatInfo> {
+    const serverUrl = this.serverUrl;
+    if (!serverUrl) return this.compat;
+    try {
+      const health = await apiRequest<Partial<HealthResponse> | undefined>(serverUrl, { path: "/health" });
+      this.compat = evaluateCompat(health, this.manifest.version);
+    } catch {
+      // offline / server busy: keep what we knew
+    }
+    this.announceCompat();
+    return this.compat;
+  }
+
+  /** Tells the user once per Obsidian start (and per state / version) what the last check found. */
+  private announceCompat(): void {
+    const { state, updateAvailable } = this.compat;
+    const key = `${state}|${updateAvailable ?? ""}`;
+    if (key === this.compatAnnounced) return;
+    this.compatAnnounced = key;
+    this.statusBar?.refresh();
+    if (state === "plugin-outdated") new Notice(t("p.update.required"), 0);
+    else if (state === "server-outdated") new Notice(this.isSelfHosted() ? t("p.update.serverOutdated") : t("p.update.serverBusy"), 0);
+    else if (updateAvailable) new Notice(t("p.update.available", { version: updateAvailable }), 15_000);
+  }
+
+  /** True when the plugin talks to a server other than the hosted Syncstone service. */
+  isSelfHosted(): boolean {
+    return this.serverUrl !== normalizeServerUrl(HOSTED_SERVER_URL);
+  }
+
+  /** Re-checked regularly: an updated server (or one that needs an update now) takes effect without a restart. */
+  private async recheckCompat(): Promise<void> {
+    const before = this.compat.state;
+    const after = (await this.checkCompat()).state;
+    if (before === after) return;
+    if (after === "ok") void this.tryStartSync();
+    else this.stopSync();
+  }
+
   async tryStartSync(): Promise<void> {
     this.stopSync();
     if (!this.settings.sessionToken || !this.settings.linkedVault) return;
+    // Plugin and server must fit together; if they do not, nothing is synced (local changes stay and go up after the update).
+    if ((await this.checkCompat()).state !== "ok") {
+      this.statusBar?.refresh();
+      return;
+    }
     // Nothing is synced before the backup notice was confirmed.
     if (!this.settings.backupAcknowledged) {
       this.showBackupNotice();

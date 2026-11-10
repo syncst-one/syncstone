@@ -251,6 +251,24 @@ export const CollabServerMessageSchema = z.discriminatedUnion("type", [
 ]);
 export type CollabServerMessage = z.infer<typeof CollabServerMessageSchema>;
 
+// --- Server info ---
+
+/**
+ * `GET /health`: liveness plus what a client needs to check that it fits this server. Every field but `status` and
+ * `protocolVersion` is optional, so older servers (which only send those two) still parse.
+ */
+export const HealthResponseSchema = z.object({
+  status: z.string(),
+  protocolVersion: z.number().int(),
+  /** Plugins below this protocol level must update before they may sync. */
+  minClientProtocolVersion: z.number().int().optional(),
+  /** Version of the server software. */
+  serverVersion: z.string().optional(),
+  /** The newest released plugin version the server knows about (empty when it does not know). */
+  latestPluginVersion: z.string().optional(),
+});
+export type HealthResponse = z.infer<typeof HealthResponseSchema>;
+
 // --- Sessions / devices ---
 
 export const SessionListItemSchema = z.object({
