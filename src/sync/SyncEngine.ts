@@ -607,7 +607,34 @@ export class SyncEngine {
         this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, allowLocalDeletes, deferred)),
       );
     }
-    for (const record of deferred) {
+    if (deferred.length > 0) {
+      const wants: Array<{ fileId: string; target: string }> = [];
+      for (const record of deferred) {
+        const item = remoteById.get(record.fileId);
+        const target = item ? await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => null) : null;
+        if (target) wants.push({ fileId: record.fileId, target });
+      }
+      await this.unblockSwaps(wants);
+    }
+    // Retried while that frees places (each move can free the name another file waits for); what is still blocked then
+    // is a real clash and settled for good (it keeps its name).
+    let pendingRecords = deferred;
+    for (let round = 0; round < 5 && pendingRecords.length > 0; round++) {
+      const again: LocalIndexRecord[] = [];
+      for (const record of pendingRecords) {
+        if (this.disposed) return;
+        await this.attempt(record.fileId, record.localPath, () =>
+          this.withFileLock(record.fileId, async () => {
+            const current = await this.deps.localIndex.get(record.fileId);
+            if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, allowLocalDeletes, again);
+          }),
+        );
+      }
+      const progress = again.length < pendingRecords.length;
+      pendingRecords = again;
+      if (!progress) break;
+    }
+    for (const record of pendingRecords) {
       if (this.disposed) return;
       await this.attempt(record.fileId, record.localPath, () =>
         this.withFileLock(record.fileId, async () => {
@@ -807,7 +834,28 @@ export class SyncEngine {
       if (deferred.length > before) held = true;
       if (done && !held) this.bumpGlobalVersion(item.version);
     }
-    for (const item of deferred) {
+    if (deferred.length > 0) {
+      const wants: Array<{ fileId: string; target: string }> = [];
+      for (const item of deferred) {
+        const target = await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => null);
+        if (target) wants.push({ fileId: item.id, target });
+      }
+      await this.unblockSwaps(wants);
+    }
+    // Retried while that frees places (each move can free the name another file waits for); what is still blocked then
+    // is a real clash and settled for good (it keeps its name).
+    let pendingItems = deferred;
+    for (let round = 0; round < 5 && pendingItems.length > 0; round++) {
+      const again: DecodedFileListItem[] = [];
+      for (const item of pendingItems) {
+        const itemPath = await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => undefined);
+        await this.attempt(item.id, itemPath, () => this.withFileLock(item.id, () => this.applyRemoteChange(item, again)));
+      }
+      const progress = again.length < pendingItems.length;
+      pendingItems = again;
+      if (!progress) break;
+    }
+    for (const item of pendingItems) {
       const itemPath = await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => undefined);
       await this.attempt(item.id, itemPath, () => this.withFileLock(item.id, () => this.applyRemoteChange(item, null)));
     }
@@ -923,6 +971,25 @@ export class SyncEngine {
     console.warn(`Syncstone: "${serverPath}" ist hier schon belegt - die Datei kommt nach "${alternative}".`);
     await this.renameRemote(item.id, alternative);
     return alternative;
+  }
+
+  /**
+   * Files that wait for each other's names (two notes swapped names elsewhere): none can move while the other still sits
+   * there. Each one whose wanted name is held only by another waiting file is parked under a free name first; the
+   * retry then moves them all to their places. A file whose name is held by anything else stays where it is.
+   */
+  private async unblockSwaps(wants: Array<{ fileId: string; target: string }>): Promise<void> {
+    const waiting = new Set(wants.map((want) => want.fileId));
+    for (const { fileId, target } of wants) {
+      const owners = await this.deps.localIndex.getAllByPath(target);
+      if (owners.length === 0 || !owners.every((owner) => owner.fileId !== fileId && waiting.has(owner.fileId))) continue;
+      await this.withFileLock(fileId, async () => {
+        const record = await this.deps.localIndex.get(fileId);
+        if (!record || !(await this.deps.fs.existsOnDisk(record.localPath))) return;
+        const parked = await this.freeSiblingPath(record.localPath);
+        if (await this.moveLocal(record.localPath, parked)) await this.deps.localIndex.put({ ...record, localPath: parked });
+      });
+    }
   }
 
   /** True if nothing at `path` stands for a file other than `item` (nothing there, or it is `item` itself). */
