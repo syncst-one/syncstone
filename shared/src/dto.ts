@@ -231,9 +231,23 @@ export const CollabRelayMessageSchema = z.object({
 });
 export type CollabRelayMessage = z.infer<typeof CollabRelayMessageSchema>;
 
+/**
+ * Server -> client: an older version of a note that this connection has open was restored by a device that is not part
+ * of the live session. The live document still holds the text from before, so the room's host (lowest `seq`) loads the
+ * restored content and puts it into the session; otherwise the next autosave would overwrite the restore.
+ */
+export const CollabRestoredMessageSchema = z.object({
+  type: z.literal("collab_restored"),
+  fileId: z.string().uuid(),
+  /** The vault version the restore got; clients ignore it once they have seen a newer write of the file. */
+  version: z.number().int(),
+});
+export type CollabRestoredMessage = z.infer<typeof CollabRestoredMessageSchema>;
+
 export const CollabServerMessageSchema = z.discriminatedUnion("type", [
   CollabPeersMessageSchema,
   CollabRelayMessageSchema,
+  CollabRestoredMessageSchema,
 ]);
 export type CollabServerMessage = z.infer<typeof CollabServerMessageSchema>;
 
@@ -466,6 +480,11 @@ export type FileRevisionListResponse = z.infer<typeof FileRevisionListResponseSc
 export const RestoreRevisionRequestSchema = z.object({
   pathCiphertext: z.string().optional(),
   pathNonce: z.string().optional(),
+  /**
+   * The restoring device is in the note's live session and already put the restored text into it. The other members get
+   * it through the session, so the server must not ask the room's host to apply it a second time.
+   */
+  appliedLive: z.boolean().optional(),
 });
 export type RestoreRevisionRequest = z.infer<typeof RestoreRevisionRequestSchema>;
 

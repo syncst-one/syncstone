@@ -1,5 +1,5 @@
 import { t } from "../i18n/index.js";
-import { MarkdownView, Notice, type App, type EventRef } from "obsidian";
+import { MarkdownView, Notice, type App, type EventRef, type TFile } from "obsidian";
 import {
   COLLAB_MAX_TEXT_LENGTH,
   merge3,
@@ -7,6 +7,7 @@ import {
   type CollabPeer,
   type CollabPeersMessage,
   type CollabRelayMessage,
+  type CollabRestoredMessage,
   type CollabServerMessage,
 } from "@websync/shared";
 import type { CryptoService } from "../sync/CryptoService.js";
@@ -38,6 +39,8 @@ export interface CollabManagerDeps {
   /** The text this device last had in common with the server for `path` (the merge base), or null if unknown. */
   mergeBase: (path: string) => Promise<string | null>;
   isEnabled: () => boolean;
+  /** The note's current content on the server (decrypted), or null if it cannot be loaded right now. */
+  loadServerText: (fileId: string) => Promise<string | null>;
   log?: SyncLog;
   /** Called whenever who-is-in-which-note may have changed, so the UI (header avatars) can re-read `presenceFor`. */
   onPresenceChange: () => void;
@@ -51,6 +54,12 @@ export interface CollabPresence {
 /** One note this device has open (and told the server about). */
 interface Room {
   fileId: string;
+  /**
+   * The note itself. Obsidian keeps the same TFile when a note is renamed or moved, so this - not the path - is what
+   * ties an open editor to its room. Looking the id up by path again after a rename could hit another file's index
+   * entry for a moment and pour this note's text into that file's room (or that file's text into this editor).
+   */
+  file: TFile;
   path: string;
   /** The editor a live session is/will be bound to. */
   view: MarkdownView;
@@ -100,10 +109,16 @@ export class CollabManager {
   constructor(private readonly deps: CollabManagerDeps) {
     const { workspace, vault } = deps.app;
     const refresh = () => this.requestRefresh();
+    // A view that now shows another note must stop feeding the old note's live session right away, not only when the
+    // queued refresh gets to it.
+    const viewChanged = () => {
+      this.detachSwitchedViews();
+      this.requestRefresh();
+    };
     this.workspaceRefs.push(
-      workspace.on("active-leaf-change", refresh),
-      workspace.on("layout-change", refresh),
-      workspace.on("file-open", refresh),
+      workspace.on("active-leaf-change", viewChanged),
+      workspace.on("layout-change", viewChanged),
+      workspace.on("file-open", viewChanged),
     );
     this.vaultRenameRef = vault.on("rename", refresh);
     // Safety net for what has no event: a new note getting its file id after
@@ -147,7 +162,24 @@ export class CollabManager {
   }
 
   handleServerMessage(message: CollabServerMessage): void {
-    this.enqueue(() => (message.type === "collab_peers" ? this.onPeers(message) : this.onRelay(message)));
+    this.enqueue(() => {
+      if (message.type === "collab_peers") return this.onPeers(message);
+      if (message.type === "collab_restored") return this.onRestored(message);
+      return this.onRelay(message);
+    });
+  }
+
+  /**
+   * Puts `text` into the live session of `fileId` as an edit of this device, so every open editor gets it at once
+   * (used when this device restores an older version while the note is co-edited). False if the note is not live here.
+   */
+  async applyLiveText(fileId: string, text: string): Promise<boolean> {
+    if (this.disposed) return false;
+    return new Promise<boolean>((resolve) => {
+      this.enqueue(() => resolve(this.putIntoSession(fileId, text)));
+      // Runs even if the task above threw or was skipped (manager disposed): then nothing was applied.
+      this.queue = this.queue.then(() => resolve(false));
+    });
   }
 
   /** Re-evaluates which notes are open / whether collaboration is enabled (also called from the settings toggle). */
@@ -193,38 +225,68 @@ export class CollabManager {
 
     const { workspace } = this.deps.app;
     const activeView = workspace.getActiveViewOfType(MarkdownView);
-    const open = new Map<string, { path: string; views: MarkdownView[] }>();
+    const open = new Map<string, { file: TFile; path: string; views: MarkdownView[] }>();
     for (const leaf of workspace.getLeavesOfType("markdown")) {
       const view = leaf.view;
       // Background tabs Obsidian hasn't loaded yet are DeferredViews - no editor, so not "open" yet.
       if (!(view instanceof MarkdownView) || !view.file || view.file.extension !== "md") continue;
-      const fileId = await this.deps.getFileId(view.file.path);
+      const file = view.file;
+      const path = file.path;
+      // A note that already has a room keeps its id, whatever happens to its name.
+      let fileId = this.roomOf(file)?.fileId ?? null;
+      if (!fileId) {
+        fileId = await this.deps.getFileId(path);
+        // Renamed or switched while we were looking: the answer may belong to the old name. The rename event brings
+        // another refresh.
+        if (view.file !== file || file.path !== path) continue;
+      }
       if (!fileId) continue;
-      const entry = open.get(fileId) ?? { path: view.file.path, views: [] };
+      const known = open.get(fileId);
+      if (known && known.file !== file) continue; // two notes claim one id: never mix them, wait until it is clear
+      const entry = known ?? { file, path, views: [] };
       entry.views.push(view);
       open.set(fileId, entry);
     }
     if (this.disposed) return;
 
     for (const room of [...this.rooms.values()]) {
-      if (!open.has(room.fileId)) this.leaveRoom(room);
+      const entry = open.get(room.fileId);
+      if (!entry || entry.file !== room.file) this.leaveRoom(room);
     }
-    for (const [fileId, { path, views }] of open) {
+    for (const [fileId, { file, path, views }] of open) {
       const preferred = activeView && views.includes(activeView) ? activeView : views[0];
       const room = this.rooms.get(fileId);
       if (!room) {
-        this.joinRoom(fileId, path, preferred);
+        this.joinRoom(fileId, file, path, preferred);
         continue;
       }
       room.path = path;
-      if (!views.includes(room.view)) this.moveView(room, preferred);
+      if (!views.includes(room.view) || room.view.file !== room.file) this.moveView(room, preferred);
     }
     this.updateStatus();
   }
 
-  private joinRoom(fileId: string, path: string, view: MarkdownView): void {
+  private roomOf(file: TFile): Room | undefined {
+    for (const room of this.rooms.values()) if (room.file === file) return room;
+    return undefined;
+  }
+
+  /** True while `room.view` still shows the room's own note - nothing may be written into the editor otherwise. */
+  private showsRoomFile(room: Room, view: MarkdownView = room.view): boolean {
+    return view.file === room.file;
+  }
+
+  /** Synchronous part of a view change: unbind every live editor whose view now shows a different note. */
+  private detachSwitchedViews(): void {
+    for (const room of this.rooms.values()) {
+      if (room.boundEditor && !this.showsRoomFile(room)) this.unbind(room);
+    }
+  }
+
+  private joinRoom(fileId: string, file: TFile, path: string, view: MarkdownView): void {
     this.rooms.set(fileId, {
       fileId,
+      file,
       path,
       view,
       you: null,
@@ -256,7 +318,7 @@ export class CollabManager {
     if (session && room.synced) {
       this.unbind(room);
       const cm = getEditorView(view);
-      if (!cm || !canBind(cm)) {
+      if (!cm || !canBind(cm) || !this.showsRoomFile(room, view)) {
         this.stopSession(room);
       } else {
         replaceEditorText(cm, session.text());
@@ -299,6 +361,35 @@ export class CollabManager {
     this.updateStatus();
   }
 
+  /**
+   * Another device restored an older version of a note that is co-edited here. The session still holds the text from
+   * before and would save it over the restore with the next keystroke, so the host (one device per room) loads the
+   * restored content and puts it into the session; everybody else gets it from there.
+   */
+  private async onRestored(message: CollabRestoredMessage): Promise<void> {
+    const room = this.rooms.get(message.fileId);
+    if (!room || !room.session || !room.synced || !this.isHost(room)) return;
+    const session = room.session;
+    const text = await this.deps.loadServerText(room.fileId);
+    if (text === null || this.rooms.get(message.fileId) !== room || room.session !== session) return;
+    this.putIntoSession(room.fileId, text);
+  }
+
+  /** Replaces the session's text with `text` through this device's bound editor (the binding sends it to the peers). */
+  private putIntoSession(fileId: string, text: string): boolean {
+    const room = this.rooms.get(fileId);
+    const cm = room?.boundEditor;
+    if (!room || !room.session || !room.synced || !cm || !this.showsRoomFile(room)) return false;
+    if (text.length > COLLAB_MAX_TEXT_LENGTH) return false;
+    replaceEditorText(cm, text);
+    return true;
+  }
+
+  private isHost(room: Room): boolean {
+    const lowest = [...room.peers].sort((a, b) => a.seq - b.seq)[0];
+    return lowest !== undefined && lowest.peerId === room.you;
+  }
+
   private async onRelay(message: CollabRelayMessage): Promise<void> {
     const room = this.rooms.get(message.fileId);
     if (!room) return;
@@ -334,7 +425,7 @@ export class CollabManager {
    */
   private startSession(room: Room, forceHost: boolean): void {
     const cm = getEditorView(room.view);
-    if (!cm || !canBind(cm)) return;
+    if (!cm || !canBind(cm) || !this.showsRoomFile(room)) return;
     const text = cm.state.doc.toString();
     if (text.length > COLLAB_MAX_TEXT_LENGTH) return; // too big for live editing - stays on plain file sync
 
@@ -414,7 +505,7 @@ export class CollabManager {
     const hostText = session.text();
 
     const cm = getEditorView(room.view);
-    if (!cm || !canBind(cm)) {
+    if (!cm || !canBind(cm) || !this.showsRoomFile(room)) {
       this.stopSession(room);
       return;
     }
@@ -428,7 +519,7 @@ export class CollabManager {
       const base = wasSynced ? null : await this.deps.mergeBase(room.path);
       if (this.rooms.get(room.fileId) !== room || room.session !== session) return;
       const latestCm = getEditorView(room.view);
-      if (!latestCm) return;
+      if (!latestCm || !this.showsRoomFile(room)) return;
       const now = latestCm.state.doc.toString();
       const hasOwnEdits = now !== hostText && (!wasSynced || now !== before);
       // Edits made here while the host did something else usually merge cleanly; only a real overlap needs a copy.
@@ -460,7 +551,7 @@ export class CollabManager {
 
   private bind(room: Room, cm: EditorView): void {
     const session = room.session;
-    if (!session) return;
+    if (!session || !this.showsRoomFile(room)) return;
     bindEditor(cm, createCollabExtension(session.ytext, session.awareness));
     room.boundEditor = cm;
   }
@@ -488,7 +579,7 @@ export class CollabManager {
   /** Puts edits this device never uploaded next to the note before the host's version replaces them. */
   private async saveConflictCopy(room: Room, text: string): Promise<void> {
     const { vault } = this.deps.app;
-    const base = room.path.replace(/\.md$/i, "");
+    const base = room.file.path.replace(/\.md$/i, "");
     const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "-");
     let candidate = `${base} (Konflikt ${stamp}).md`;
     for (let counter = 2; vault.getAbstractFileByPath(candidate); counter++) {

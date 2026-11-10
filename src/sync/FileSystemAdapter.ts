@@ -152,37 +152,48 @@ export class FileSystemAdapter {
     await this.pruneEmptyParentFolders(normalized);
   }
 
-  async renamePath(oldPath: string, newPath: string): Promise<void> {
+  /**
+   * Moves the file at `oldPath` to `newPath`. Returns false when nothing was moved because something else already lives
+   * at `newPath` (both stay untouched). The caller must then NOT treat the file at `newPath` as the moved one.
+   * True when it was moved, or when there was nothing at `oldPath` to move.
+   */
+  async renamePath(oldPath: string, newPath: string): Promise<boolean> {
     assertInsideVault(oldPath);
     assertInsideVault(newPath);
     const normalizedOld = normalizePath(oldPath);
     const normalizedNew = normalizePath(newPath);
-    if (normalizedOld === normalizedNew) return;
+    if (normalizedOld === normalizedNew) return true;
 
     const file = this.getFileByPath(normalizedOld);
     if (!file) {
       // Same unindexed-file case as in `deleteByPath`.
       const adapter = this.app.vault.adapter;
       const stat = await adapter.stat(normalizedOld);
-      if (stat?.type !== "file") return;
+      if (stat?.type !== "file") return true;
+      if (await this.isTakenBySomethingElse(normalizedOld, normalizedNew)) return false;
       await this.ensureParentFolder(normalizedNew);
       await adapter.rename(normalizedOld, normalizedNew);
       await this.pruneEmptyParentFolders(normalizedOld);
-      return;
+      return true;
     }
 
+    if (await this.isTakenBySomethingElse(normalizedOld, normalizedNew)) return false;
     await this.ensureParentFolder(normalizedNew);
     try {
       await this.app.vault.rename(file, normalizedNew);
     } catch (err) {
-      // Something already lives at the target path. Leave both untouched (no
-      // data loss); the caller's follow-up reconcile/download handles the
-      // content at `newPath`.
       if (!isAlreadyExistsError(err)) throw err;
       console.warn(`Syncstone: Umbenennen von "${normalizedOld}" nach "${normalizedNew}" übersprungen - Ziel existiert bereits.`);
-      return;
+      return false;
     }
     await this.pruneEmptyParentFolders(normalizedOld);
+    return true;
+  }
+
+  /** Something other than the file itself sits at `target` (a case-only rename on a case-insensitive disk is fine). */
+  private async isTakenBySomethingElse(source: string, target: string): Promise<boolean> {
+    if (source.toLowerCase() === target.toLowerCase()) return false;
+    return this.existsOnDisk(target);
   }
 
   /**

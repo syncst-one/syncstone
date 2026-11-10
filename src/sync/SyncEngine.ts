@@ -129,6 +129,12 @@ export class SyncEngine {
 
   /** Set by `dispose()`: a sync that is still running (the first one runs in the background) stops at its next file. */
   private disposed = false;
+  /**
+   * Moves this engine makes itself while applying another device's rename (new path -> old path). Obsidian reports them
+   * as an ordinary `rename` event; treating that as a user rename sent a second rename to the server, looked up by the
+   * OLD path - and when another file had taken that name meanwhile, the wrong file got renamed on the server.
+   */
+  private readonly ownRenames = new Map<string, string>();
   /** Per file (or remote item) that failed: when it may be tried again, and how many times in a row it failed. */
   private readonly failed = new Map<string, { until: number; count: number }>();
   /** When a full sync / poll last finished: how up to date this device is with the server's renames and edits. */
@@ -333,10 +339,35 @@ export class SyncEngine {
       return;
     }
     if (!(file instanceof TFile)) return;
+    const newPath = file.path;
     this.deps.transfers?.release(oldPath); // renamed before it was sent: the waiting circle belongs to the old name
     this.deps.transfers?.clearFailure(oldPath);
+    if (this.ownRenames.get(newPath) === oldPath) {
+      // Our own move (another device renamed the file): the server already has the new name. An edit that was still
+      // waiting under the old name goes along to the new one.
+      this.ownRenames.delete(newPath);
+      if (this.debounceTimers.has(oldPath)) {
+        this.clearDebounce(oldPath);
+        this.scheduleDebounced(newPath, () => this.processLocalChange("modify", newPath), newPath);
+      }
+      return;
+    }
     this.clearDebounce(oldPath);
-    this.scheduleDebounced(file.path, () => this.processLocalRename(oldPath, file.path));
+    this.scheduleDebounced(newPath, () => this.processLocalRename(oldPath, newPath));
+  }
+
+  /**
+   * Uploads a change of `path` that is still waiting for its debounce right now (e.g. before restoring an older
+   * version, so the pending edit cannot land on top of the restore a moment later).
+   */
+  async flushPath(path: string): Promise<void> {
+    if (!this.debounceTimers.has(path)) return;
+    this.clearDebounce(path);
+    try {
+      await this.processLocalChange("modify", path);
+    } finally {
+      this.deps.transfers?.release(path);
+    }
   }
 
   // ============================================================
@@ -545,12 +576,12 @@ export class SyncEngine {
     const localFiles = this.deps.fs.listAllFiles();
     const localByPath = new Map(localFiles.map((f) => [f.path, f] as const));
 
-    const indexRecords = await this.deps.localIndex.getAll();
-    const knownFileIds = new Set(indexRecords.map((r) => r.fileId));
-
     const remoteResp = await this.deps.remote.listFiles(this.deps.vaultId, 0, true);
     const remoteById = new Map(remoteResp.files.map((item) => [item.id, item] as const));
     this.bumpGlobalVersion(remoteResp.currentVersion);
+
+    const indexRecords = await this.repairDuplicatePaths(await this.deps.localIndex.getAll(), remoteById);
+    const knownFileIds = new Set(indexRecords.map((r) => r.fileId));
 
     const handledPaths = new Set<string>();
 
@@ -568,10 +599,21 @@ export class SyncEngine {
     }
 
     // --- Phase A ---
+    // Renames whose new name is still taken by another file of this pass (swapped names) are retried at the end.
+    const deferred: LocalIndexRecord[] = [];
     for (const record of indexRecords) {
       if (this.disposed) return;
       await this.attempt(record.fileId, record.localPath, () =>
-        this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, allowLocalDeletes)),
+        this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, allowLocalDeletes, deferred)),
+      );
+    }
+    for (const record of deferred) {
+      if (this.disposed) return;
+      await this.attempt(record.fileId, record.localPath, () =>
+        this.withFileLock(record.fileId, async () => {
+          const current = await this.deps.localIndex.get(record.fileId);
+          if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, allowLocalDeletes, null);
+        }),
       );
     }
 
@@ -664,6 +706,7 @@ export class SyncEngine {
     localByPath: Map<string, TFile>,
     handledPaths: Set<string>,
     allowLocalDeletes: boolean,
+    deferred: LocalIndexRecord[] | null,
   ): Promise<void> {
     const remoteItem = remoteById.get(record.fileId);
     const localFile = localByPath.get(record.localPath);
@@ -699,17 +742,21 @@ export class SyncEngine {
       return;
     }
 
-    if (path !== record.localPath) {
-      await this.deps.fs.renamePath(record.localPath, path); // no-op if the local file is already missing
-      if (!isMarkerPath(path)) this.deps.log?.add({ kind: "rename-down", path, args: [record.localPath] });
-      this.deps.transfers?.clearFailure(record.localPath);
+    const samePath = path === record.localPath;
+    if (!samePath) {
+      // Renamed on another device. Never take whatever file sits at the new name for this one (see placeLocally).
+      const placed = await this.placeLocally(remoteItem, record, path, deferred !== null);
+      if (placed === null) {
+        deferred?.push(record);
+        return;
+      }
+      path = placed;
       handledPaths.add(path);
     }
 
-    const currentLocalFile = this.deps.fs.getFileByPath(path) ?? localByPath.get(path);
+    const currentLocalFile = this.deps.fs.getFileByPath(path) ?? (samePath ? localByPath.get(path) : undefined);
     if (!currentLocalFile) {
       const remoteUnchanged = toBase64(remoteItem.contentHashBlinded) === record.lastContentHashBlinded;
-      const samePath = path === record.localPath;
       if (isMarkerPath(path)) {
         // The marker is a dot-file Obsidian never indexes. Its folder being gone means the folder was deleted here.
         if (allowLocalDeletes && remoteUnchanged && samePath && !(await this.deps.fs.existsOnDisk(parentOf(path)))) {
@@ -749,11 +796,22 @@ export class SyncEngine {
     // the cursor and gets fetched again by the next poll instead of being skipped for good.
     const changes = [...remoteResp.files].sort((a, b) => a.version - b.version);
     await this.announceRemoteChanges(changes);
+    // A file whose new place is still taken by another file of the same batch (two notes swapped names, a note took a
+    // freed name) waits until the rest of the batch has moved out of the way, then gets another try.
+    const deferred: DecodedFileListItem[] = [];
+    let held = false;
     for (const item of changes) {
       const itemPath = item.isDeleted ? undefined : await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => undefined);
-      const done = await this.attempt(item.id, itemPath, () => this.withFileLock(item.id, () => this.applyRemoteChange(item)));
-      if (done) this.bumpGlobalVersion(item.version);
+      const before = deferred.length;
+      const done = await this.attempt(item.id, itemPath, () => this.withFileLock(item.id, () => this.applyRemoteChange(item, deferred)));
+      if (deferred.length > before) held = true;
+      if (done && !held) this.bumpGlobalVersion(item.version);
     }
+    for (const item of deferred) {
+      const itemPath = await this.deps.crypto.decryptPath(item.pathCiphertext, item.pathNonce).catch(() => undefined);
+      await this.attempt(item.id, itemPath, () => this.withFileLock(item.id, () => this.applyRemoteChange(item, null)));
+    }
+    if (held && this.runFailures === 0) for (const item of changes) this.bumpGlobalVersion(item.version);
     // A change that could not be applied must be fetched again, and the others after it come with it: back to where this poll began.
     if (this.runFailures > 0) this.currentGlobalVersion = since;
     else this.bumpGlobalVersion(remoteResp.currentVersion);
@@ -776,7 +834,8 @@ export class SyncEngine {
     tracker.queue(paths);
   }
 
-  private async applyRemoteChange(item: DecodedFileListItem): Promise<void> {
+  /** `deferred`: where an item goes whose place is taken for now (null = last try, settle it now). */
+  private async applyRemoteChange(item: DecodedFileListItem, deferred: DecodedFileListItem[] | null = null): Promise<void> {
     const record = await this.deps.localIndex.get(item.id);
 
     if (item.isDeleted) {
@@ -806,11 +865,12 @@ export class SyncEngine {
     }
     if (this.deps.isConfigPath(path)) return;
 
-    if (record && record.localPath !== path) {
-      await this.deps.fs.renamePath(record.localPath, path);
-      if (!isMarkerPath(path)) this.deps.log?.add({ kind: "rename-down", path, args: [record.localPath] });
-      this.deps.transfers?.clearFailure(record.localPath);
+    const placed = await this.placeLocally(item, record, path, deferred !== null);
+    if (placed === null) {
+      deferred?.push(item);
+      return;
     }
+    path = placed;
 
     const localFile = this.deps.fs.getFileByPath(path);
     if (!localFile) {
@@ -818,6 +878,140 @@ export class SyncEngine {
       return;
     }
     await this.reconcileExisting(item, path, localFile);
+  }
+
+  // ============================================================
+  // Where a remote file lives locally
+  // ============================================================
+
+  /**
+   * Finds the local place for file `item` that the server says lives at `serverPath`, moving this device's copy there
+   * when another device renamed it. The rule that keeps contents in their own file: a local file is only ever treated
+   * as `item` when nothing says it is a different file. A place taken by another file is never touched:
+   *  - `mayDefer`: returns null so the caller can retry after the rest of the batch (swapped names);
+   *  - otherwise this device's copy keeps its current name (or, if it has none yet, gets a free name next to the taken
+   *    one) and the server is told that name, so all devices agree again.
+   * Returns the local path to use for `item`.
+   */
+  private async placeLocally(
+    item: DecodedFileListItem,
+    record: LocalIndexRecord | undefined,
+    serverPath: string,
+    mayDefer: boolean,
+  ): Promise<string | null> {
+    const from = record && record.localPath !== serverPath ? record.localPath : null;
+    const haveLocalCopy = from !== null && (await this.isOurs(from, item.id)) && (await this.deps.fs.existsOnDisk(from));
+
+    if (await this.isFreeFor(serverPath, item)) {
+      if (!haveLocalCopy || !record || from === null) return serverPath;
+      if (await this.moveLocal(from, serverPath)) {
+        await this.deps.localIndex.put({ ...record, localPath: serverPath });
+        if (!isMarkerPath(serverPath)) this.deps.log?.add({ kind: "rename-down", path: serverPath, args: [from] });
+        this.deps.transfers?.clearFailure(from);
+        return serverPath;
+      }
+    }
+
+    // The place is taken by another file.
+    if (mayDefer) return null;
+    if (haveLocalCopy && from !== null) {
+      console.warn(`Syncstone: "${serverPath}" ist hier schon belegt - "${from}" behält seinen Namen.`);
+      await this.renameRemote(item.id, from);
+      return from;
+    }
+    const alternative = await this.freeSiblingPath(serverPath);
+    console.warn(`Syncstone: "${serverPath}" ist hier schon belegt - die Datei kommt nach "${alternative}".`);
+    await this.renameRemote(item.id, alternative);
+    return alternative;
+  }
+
+  /** True if nothing at `path` stands for a file other than `item` (nothing there, or it is `item` itself). */
+  private async isFreeFor(path: string, item: DecodedFileListItem): Promise<boolean> {
+    if (!(await this.deps.fs.existsOnDisk(path))) return true;
+    const owners = await this.deps.localIndex.getAllByPath(path);
+    if (owners.length > 0) return owners.every((owner) => owner.fileId === item.id);
+    // A file the sync does not know yet. For a file that is new to this device too, that is the usual "same note on both
+    // sides" case: they are compared and, if different, merged or the losing side kept as a conflict copy. For a file
+    // this device already has elsewhere, it is a different file unless the content is identical.
+    if (!(await this.deps.localIndex.get(item.id))) return true;
+    const local = this.deps.fs.getFileByPath(path);
+    if (!local) return false;
+    const bytes = await this.readLocal(local);
+    if (!bytes) return true; // gone meanwhile: the place is free
+    return toBase64(await this.deps.crypto.hashContent(bytes)) === toBase64(item.contentHashBlinded);
+  }
+
+  /** True if no other index record claims `path`. */
+  private async isOurs(path: string, fileId: string): Promise<boolean> {
+    return (await this.deps.localIndex.getAllByPath(path)).every((owner) => owner.fileId === fileId);
+  }
+
+  /** Moves a file because another device renamed it; the vault's rename event for it is recognised as ours. */
+  private async moveLocal(oldPath: string, newPath: string): Promise<boolean> {
+    this.ownRenames.set(newPath, oldPath);
+    try {
+      return await this.deps.fs.renamePath(oldPath, newPath);
+    } finally {
+      // The event normally arrives during the move; drop a leftover entry so a later real rename is not swallowed.
+      window.setTimeout(() => {
+        if (this.ownRenames.get(newPath) === oldPath) this.ownRenames.delete(newPath);
+      }, 2000);
+    }
+  }
+
+  private async renameRemote(fileId: string, path: string): Promise<void> {
+    try {
+      const encryptedPath = await this.deps.crypto.encryptPath(path);
+      await this.deps.remote.renameFile(this.deps.vaultId, fileId, encryptedPath.ciphertext, encryptedPath.iv);
+    } catch (err) {
+      // Not fatal: this device keeps its name for now, and the next full sync reports it again.
+      console.warn(`Syncstone: neuer Name "${path}" konnte nicht an den Server gemeldet werden`, err);
+    }
+  }
+
+  /** `Folder/Note.md` -> `Folder/Note 2.md` (the first name that is free here). */
+  private async freeSiblingPath(path: string): Promise<string> {
+    const slash = path.lastIndexOf("/");
+    const dot = path.lastIndexOf(".");
+    const hasExt = dot > slash + 1;
+    const stem = hasExt ? path.slice(0, dot) : path;
+    const ext = hasExt ? path.slice(dot) : "";
+    for (let n = 2; ; n++) {
+      const candidate = `${stem} ${n}${ext}`;
+      if (!(await this.deps.fs.existsOnDisk(candidate)) && (await this.deps.localIndex.getAllByPath(candidate)).length === 0) return candidate;
+    }
+  }
+
+  /**
+   * Earlier versions could leave two index records on one path. Neither may then be trusted with the file there: the
+   * one the server also places at that path keeps it, the others are forgotten and handled like files this device has
+   * not seen yet (they are fetched to their own place). Returns the records that remain.
+   */
+  private async repairDuplicatePaths(records: LocalIndexRecord[], remoteById: Map<string, DecodedFileListItem>): Promise<LocalIndexRecord[]> {
+    const byPath = new Map<string, LocalIndexRecord[]>();
+    for (const record of records) byPath.set(record.localPath, [...(byPath.get(record.localPath) ?? []), record]);
+    const dropped = new Set<string>();
+    for (const [path, group] of byPath) {
+      if (group.length < 2) continue;
+      const keepers: LocalIndexRecord[] = [];
+      for (const record of group) {
+        const remote = remoteById.get(record.fileId);
+        if (!remote || remote.isDeleted) continue;
+        try {
+          if ((await this.deps.crypto.decryptPath(remote.pathCiphertext, remote.pathNonce)) === path) keepers.push(record);
+        } catch {
+          // unreadable path: not a keeper
+        }
+      }
+      const keep = keepers.length === 1 ? keepers[0].fileId : null;
+      console.warn(`Syncstone: ${group.length} Index-Einträge für "${path}" - werden neu zugeordnet.`);
+      for (const record of group) {
+        if (record.fileId === keep) continue;
+        dropped.add(record.fileId);
+        await this.deps.localIndex.delete(record.fileId);
+      }
+    }
+    return records.filter((record) => !dropped.has(record.fileId));
   }
 
   // ============================================================
@@ -871,10 +1065,20 @@ export class SyncEngine {
 
     const bothChanged = lastHash !== remoteHashBase64 && lastHash !== localHashBase64;
     const live = this.deps.isCollabLive?.(item.id) ?? false;
-    if (bothChanged && !live && isMergeablePath(path) && (await this.tryMerge(item, path, localFile, localBytes, lastHash, remoteWins))) return;
+    let copied = false;
+    if (bothChanged && !live && isMergeablePath(path)) {
+      const outcome = await this.tryMerge(item, path, localFile, localBytes, lastHash, remoteWins);
+      if (outcome === "merged") return;
+      copied = outcome === "copied";
+    }
 
     if (remoteWins) {
       if (live) return; // the live session already carries this content
+      // Both sides changed and this device's version loses: it must not just vanish. (A losing server version stays in
+      // the version history; a losing local one exists nowhere else.) Notes that could be merged were handled above;
+      // this covers everything else - images, PDFs, notes too large or not readable as text.
+      const willDownload = !(Platform.isMobile && item.contentSize > this.mobileLimit());
+      if (bothChanged && !copied && willDownload) await this.saveConflictCopy(path, localBytes);
       await this.downloadFile(item, path, bothChanged ? "newer" : "remote");
     } else {
       await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: localHash }, bothChanged ? "newer" : "local");
@@ -915,25 +1119,25 @@ export class SyncEngine {
     localBytes: Uint8Array,
     lastHash: string | undefined,
     remoteWins: boolean,
-  ): Promise<boolean> {
-    if (localBytes.byteLength > MERGE_MAX_BYTES || item.contentSize > MERGE_MAX_BYTES) return false;
+  ): Promise<"merged" | "copied" | "none"> {
+    if (localBytes.byteLength > MERGE_MAX_BYTES || item.contentSize > MERGE_MAX_BYTES) return "none";
     let remoteBytes: Uint8Array;
     try {
       remoteBytes = await this.fetchRemotePlaintext(item);
     } catch (err) {
       console.warn("Syncstone: Server-Version für den Merge nicht ladbar", err);
-      return false;
+      return "none";
     }
     const localText = decodeText(localBytes);
     const remoteText = decodeText(remoteBytes);
-    if (localText === null || remoteText === null) return false;
+    if (localText === null || remoteText === null) return "none";
 
     const base = lastHash ? await this.deps.localIndex.getBase(item.id).catch(() => undefined) : undefined;
     const merged = base && base.hash === lastHash ? merge3(base.text, localText, remoteText) : null;
 
     if (merged === null) {
       await this.saveConflictCopy(path, remoteWins ? localText : remoteText);
-      return false;
+      return "copied";
     }
     if (merged === remoteText) {
       await this.downloadFile(item, path, "newer");
@@ -947,20 +1151,22 @@ export class SyncEngine {
       new Notice(t("merge.merged", { path }), 8000);
       this.deps.log?.add({ kind: "merged", path });
     }
-    return true;
+    return "merged";
   }
 
   /** Puts the text that is about to lose against the other version next to the note (it syncs like any new note). */
-  private async saveConflictCopy(path: string, text: string): Promise<void> {
-    const base = path.replace(/\.(md|txt)$/i, "");
-    const ext = path.slice(base.length) || ".md";
+  private async saveConflictCopy(path: string, content: string | Uint8Array): Promise<void> {
+    const slash = path.lastIndexOf("/");
+    const dot = path.lastIndexOf(".");
+    const base = dot > slash + 1 ? path.slice(0, dot) : path;
+    const ext = path.slice(base.length);
     const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "-");
     let candidate = `${base} (${t("merge.conflictStamp")} ${stamp})${ext}`;
     for (let counter = 2; (await this.deps.fs.existsOnDisk(candidate)); counter++) {
       candidate = `${base} (${t("merge.conflictStamp")} ${stamp} ${counter})${ext}`;
     }
     try {
-      await this.deps.fs.writeBinary(candidate, textEncoder.encode(text));
+      await this.deps.fs.writeBinary(candidate, typeof content === "string" ? textEncoder.encode(content) : content);
       new Notice(t("merge.conflictCopy", { path, copy: candidate }), 12_000);
       this.deps.log?.add({ kind: "conflict", path, args: [candidate] });
     } catch (err) {

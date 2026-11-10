@@ -351,8 +351,15 @@ export class RemoteApiClient {
   }
 
   /** Makes an older version current again (also brings back a deleted file, optionally under another path). */
-  async restoreRevision(vaultId: string, fileId: string, revisionId: string, newPath?: { ciphertext: Uint8Array; iv: Uint8Array }): Promise<void> {
+  async restoreRevision(
+    vaultId: string,
+    fileId: string,
+    revisionId: string,
+    newPath?: { ciphertext: Uint8Array; iv: Uint8Array },
+    appliedLive = false,
+  ): Promise<void> {
     const body: RestoreRevisionRequest = newPath ? { pathCiphertext: toBase64(newPath.ciphertext), pathNonce: toBase64(newPath.iv) } : {};
+    if (appliedLive) body.appliedLive = true;
     await apiRequest<unknown>(this.serverUrl, {
       method: "POST",
       path: `/vaults/${vaultId}/files/${fileId}/revisions/${revisionId}/restore`,

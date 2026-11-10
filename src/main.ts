@@ -1,6 +1,6 @@
-import { normalizePath, Notice, Plugin, TFile } from "obsidian";
+import { MarkdownView, normalizePath, Notice, Plugin, TFile } from "obsidian";
 import { applyHistoryTexts, t } from "./i18n";
-import { REMOTE_POLL_INTERVAL_MS, toBase64, type MeResponse } from "@websync/shared";
+import { REMOTE_POLL_INTERVAL_MS, toBase64, unpackBlob, type MeResponse } from "@websync/shared";
 import { DEFAULT_SETTINGS, type SyncstoneSettings } from "./types.js";
 import { HOSTED_SERVER_URL, normalizeServerUrl } from "./hosted.js";
 import { AuthClient } from "./sync/AuthClient.js";
@@ -465,6 +465,16 @@ export default class SyncstonePlugin extends Plugin {
         },
         log: this.syncLog,
         isEnabled: () => this.settings.collabEnabled && !this.settings.syncPaused,
+        loadServerText: async (fileId) => {
+          try {
+            const { ciphertext, iv } = unpackBlob(await this.remoteApi.downloadBlob(linkedVault.vaultId, fileId));
+            const bytes = await this.cryptoService.decryptContent(ciphertext, iv);
+            return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+          } catch (err) {
+            console.warn("Syncstone: wiederhergestellte Version konnte nicht geladen werden", err);
+            return null;
+          }
+        },
         onPresenceChange: () => this.headerActions?.refresh(),
       });
       this.collabManager = collabManager;
@@ -554,6 +564,24 @@ export default class SyncstonePlugin extends Plugin {
     await leaf.setViewState({ type: HISTORY_DIFF_VIEW_TYPE, active: true });
     await this.app.workspace.revealLeaf(leaf);
     if (leaf.view instanceof HistoryDiffView) await leaf.view.setTarget(fileId, revisionId);
+  }
+
+  /**
+   * Writes what is typed in `path` to disk now and uploads it right away instead of after the usual delays. Used before
+   * a restore: an edit still waiting there would otherwise be saved over the restored version a moment later.
+   */
+  async flushNote(path: string): Promise<void> {
+    for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+      const view = leaf.view;
+      if (view instanceof MarkdownView && view.file?.path === path) {
+        try {
+          await view.save();
+        } catch (err) {
+          console.warn("Syncstone: Notiz konnte vor dem Wiederherstellen nicht gespeichert werden", err);
+        }
+      }
+    }
+    await this.syncEngine?.flushPath(path);
   }
 
   /** Shared by the periodic poll interval and the LiveSyncClient's push trigger (and a restore from the history view). */

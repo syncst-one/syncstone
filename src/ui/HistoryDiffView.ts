@@ -127,7 +127,19 @@ export class HistoryDiffView extends ItemView {
         newPath = await this.freePath(entry.path, "wiederhergestellt");
       }
       const encrypted = newPath ? await this.plugin.cryptoService.encryptPath(newPath) : undefined;
-      await this.plugin.remoteApi.restoreRevision(vaultId, entry.fileId, entry.id, encrypted);
+      let appliedLive = false;
+      if (record) {
+        // A pending edit must reach the server before the restore, not land on top of it a moment later.
+        await this.plugin.flushNote(record.localPath);
+        // Co-edited right now: the open editors only learn about the restore through the live session (otherwise its
+        // old text is saved over the restore with the next keystroke), so it goes in there first.
+        const collab = this.plugin.collabManager;
+        if (collab?.isLive(entry.fileId)) {
+          const text = await this.revisionText(vaultId, entry);
+          if (text !== null) appliedLive = await collab.applyLiveText(entry.fileId, text);
+        }
+      }
+      await this.plugin.remoteApi.restoreRevision(vaultId, entry.fileId, entry.id, encrypted, appliedLive);
       new Notice(record ? t("p.restored") : t("p.fileRestored", { path: newPath ?? entry.path ?? "" }));
       this.plugin.pollNow();
       await this.reload();
@@ -137,6 +149,18 @@ export class HistoryDiffView extends ItemView {
       this.busy = false;
       this.confirming = false;
       this.render();
+    }
+  }
+
+  /** The text of an older version, or null for a file that is not text. */
+  private async revisionText(vaultId: string, entry: RevisionEntry): Promise<string | null> {
+    const blob = await this.plugin.remoteApi.downloadRevision(vaultId, entry.fileId, entry.id);
+    const { ciphertext, iv } = unpackBlob(blob);
+    const bytes = await this.plugin.cryptoService.decryptContent(ciphertext, iv);
+    try {
+      return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    } catch {
+      return null;
     }
   }
 

@@ -81,9 +81,23 @@ export class LocalIndex {
     return this.request<LocalIndexRecord | undefined>(this.store("readonly").get(fileId));
   }
 
+  /**
+   * The record of the file at `localPath`. Undefined when none - and also when several records claim the same path:
+   * picking one of them at random is how content used to end up in the wrong file, so an unclear case is "unknown".
+   */
   async getByPath(localPath: string): Promise<LocalIndexRecord | undefined> {
+    const records = await this.getAllByPath(localPath);
+    if (records.length > 1) {
+      console.warn(`Syncstone: ${records.length} Einträge für "${localPath}" im Index - Zuordnung unklar, wird übersprungen.`);
+      return undefined;
+    }
+    return records[0];
+  }
+
+  /** Every record that claims `localPath` (normally zero or one). */
+  async getAllByPath(localPath: string): Promise<LocalIndexRecord[]> {
     const index = this.store("readonly").index(PATH_INDEX);
-    return this.request<LocalIndexRecord | undefined>(index.get(localPath));
+    return this.request<LocalIndexRecord[]>(index.getAll(localPath));
   }
 
   async put(record: LocalIndexRecord): Promise<void> {
