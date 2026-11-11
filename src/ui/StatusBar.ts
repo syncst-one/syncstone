@@ -130,12 +130,12 @@ export class SyncstoneStatusBar {
       );
     }
 
-    if (!this.plugin.settings.backupAcknowledged) {
+    if (this.plugin.settings.linkedVault && !this.plugin.settings.backupAcknowledged) {
       menu.addItem((item) =>
         item
-          .setTitle(t("p.backup.confirm"))
+          .setTitle(t("p.firstSync.open"))
           .setIcon("play")
-          .onClick(() => void this.plugin.acknowledgeBackup()),
+          .onClick(() => void this.plugin.tryStartSync()),
       );
     }
 

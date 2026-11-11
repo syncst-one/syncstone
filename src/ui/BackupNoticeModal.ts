@@ -1,14 +1,18 @@
 import { Modal, Setting, type App } from "obsidian";
-import { t } from "../i18n/index.js";
+import { t, tn } from "../i18n/index.js";
+import type { FirstSyncPreview } from "../sync/firstSyncPreview.js";
 
 /**
- * Shown once after the plugin was installed, before anything is synced: sync tools can make mistakes, so the user makes a
- * backup first. "Start syncing" is the confirmation; "Not now" keeps sync switched off and asks again next time;
- * until then the settings tab and the status menu offer the same confirmation.
+ * Shown before the first sync of a linked vault, before anything is transferred: the backup hint and what the sync would
+ * do (counted by `previewFirstSync`), with a warning when this folder and the server vault look like two different vaults.
+ * Confirming starts the sync; "Not now" keeps it off and asks again next time (the settings tab and the status menu
+ * open this again until then). `preview` is null when it could not be counted (e.g. offline).
  */
 export class BackupNoticeModal extends Modal {
   constructor(
     app: App,
+    private readonly vaultName: string,
+    private readonly preview: FirstSyncPreview | null,
     private readonly onConfirm: () => void | Promise<void>,
     private readonly onClosed: () => void,
   ) {
@@ -16,20 +20,41 @@ export class BackupNoticeModal extends Modal {
   }
 
   onOpen(): void {
-    this.titleEl.setText(t("p.backup.title"));
-    this.contentEl.createEl("p", { text: t("p.backup.text") });
-    this.contentEl.createEl("p", { text: t("p.backup.laterHint"), cls: "setting-item-description" });
-    new Setting(this.contentEl)
+    const { contentEl, preview } = this;
+    this.titleEl.setText(t("p.firstSync.title"));
+
+    if (preview?.mismatch) {
+      contentEl.createEl("p", { text: t("p.firstSync.mismatch", { vault: this.vaultName }), cls: "mod-warning" });
+    }
+
+    if (preview) {
+      const rows: string[] = [];
+      if (preview.download > 0) rows.push(tn("p.firstSync.download", preview.download));
+      if (preview.upload > 0) rows.push(tn("p.firstSync.upload", preview.upload));
+      if (preview.same > 0) rows.push(tn("p.firstSync.same", preview.same));
+      if (preview.differ > 0) rows.push(tn("p.firstSync.differ", preview.differ));
+      if (rows.length === 0) contentEl.createEl("p", { text: t("p.firstSync.nothing") });
+      else {
+        const list = contentEl.createEl("ul");
+        for (const row of rows) list.createEl("li", { text: row });
+      }
+    } else {
+      contentEl.createEl("p", { text: t("p.firstSync.failed"), cls: "setting-item-description" });
+    }
+
+    contentEl.createEl("p", { text: t("p.backup.text") });
+    contentEl.createEl("p", { text: t("p.backup.laterHint"), cls: "setting-item-description" });
+
+    new Setting(contentEl)
       .addButton((button) => button.setButtonText(t("p.backup.later")).onClick(() => this.close()))
-      .addButton((button) =>
-        button
-          .setButtonText(t("p.backup.confirm"))
-          .setCta()
-          .onClick(() => {
-            this.close();
-            void this.onConfirm();
-          }),
-      );
+      .addButton((button) => {
+        button.setButtonText(t(preview?.mismatch ? "p.firstSync.merge" : "p.backup.confirm")).onClick(() => {
+          this.close();
+          void this.onConfirm();
+        });
+        if (preview?.mismatch) button.setWarning();
+        else button.setCta();
+      });
   }
 
   onClose(): void {

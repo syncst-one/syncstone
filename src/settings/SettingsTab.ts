@@ -119,16 +119,16 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
     if (settings.accountUsername && settings.sessionToken) status.createSpan({ cls: "syncstone-status-account", text: settings.accountUsername });
     this.renderUpdateInfo(parent);
 
-    // "Not now" on the backup notice: sync stays off until it is confirmed here (or in the status menu).
-    if (!settings.backupAcknowledged) {
+    // "Not now" on the first-sync check: sync stays off until it is confirmed (opened again from here or the status menu).
+    if (settings.linkedVault && !settings.backupAcknowledged) {
       new Setting(parent)
-        .setName(t("p.backup.title"))
+        .setName(t("p.firstSync.title"))
         .setDesc(t("p.backup.pending"))
         .addButton((btn) =>
           btn
-            .setButtonText(t("p.backup.confirm"))
+            .setButtonText(t("p.firstSync.open"))
             .setCta()
-            .onClick(() => void this.plugin.acknowledgeBackup()),
+            .onClick(() => void this.plugin.tryStartSync()),
         );
     }
   }
@@ -772,6 +772,7 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
 
   private async applyVaultLink(result: VaultLinkResult, remember: boolean): Promise<void> {
     this.plugin.settings.linkedVault = result.config;
+    this.plugin.settings.backupAcknowledged = false; // a newly linked vault gets the first-sync check before anything moves
     this.plugin.settings.rememberKey = remember;
     this.plugin.settings.cachedKeyMaterial = remember && result.rootBitsBase64 ? { rootBitsBase64: result.rootBitsBase64 } : null;
     this.plugin.settings.lastSyncAt = null;

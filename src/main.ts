@@ -27,6 +27,7 @@ import { PublishService } from "./publish/PublishService.js";
 import { PublishModal } from "./ui/PublishModal.js";
 import { SyncLogModal } from "./ui/SyncLogModal.js";
 import { BackupNoticeModal } from "./ui/BackupNoticeModal.js";
+import { previewFirstSync, type FirstSyncPreview } from "./sync/firstSyncPreview.js";
 import { HISTORY_DIFF_VIEW_TYPE, HistoryDiffView } from "./ui/HistoryDiffView.js";
 
 export default class SyncstonePlugin extends Plugin {
@@ -165,8 +166,7 @@ export default class SyncstonePlugin extends Plugin {
     // fully built - `vault.getFiles()` and vault events are not reliable
     // before layout-ready fires.
     this.app.workspace.onLayoutReady(() => {
-      // Right after the installation: the backup notice comes before anything else.
-      if (!this.settings.backupAcknowledged) this.showBackupNotice();
+      // Before the first sync of a linked vault, tryStartSync shows the first-sync check (backup hint + what would happen).
       void this.tryStartSync().then(() => {
         // Not signed in: tryStartSync did not ask the server, but a newer plugin version is still worth a hint.
         if (!this.settings.sessionToken || !this.settings.linkedVault) void this.checkCompat();
@@ -178,17 +178,49 @@ export default class SyncstonePlugin extends Plugin {
 
   private backupNoticeOpen = false;
 
-  /** The backup notice (see BackupNoticeModal); confirming it starts the sync. */
-  showBackupNotice(): void {
-    if (this.backupNoticeOpen || this.settings.backupAcknowledged) return;
+  /**
+   * The check before the first sync of a linked vault (see BackupNoticeModal): counts what the sync would download and
+   * upload, then shows that with the backup hint. Confirming it starts the sync. Needs the vault unlocked (paths are
+   * encrypted on the server), so tryStartSync calls it after unlocking.
+   */
+  private async showBackupNotice(): Promise<void> {
+    const linked = this.settings.linkedVault;
+    if (this.backupNoticeOpen || this.settings.backupAcknowledged || !linked || !this.cryptoService.isUnlocked()) return;
     this.backupNoticeOpen = true;
+    const checking = new Notice(t("p.firstSync.checking"), 0);
+    let preview: FirstSyncPreview | null = null;
+    try {
+      preview = await previewFirstSync({
+        vaultId: linked.vaultId,
+        remote: this.remoteApi,
+        crypto: this.cryptoService,
+        fs: this.fsAdapter,
+        isConfigPath: (path) => this.isConfigPath(path),
+      });
+    } catch (err) {
+      console.warn("Syncstone: Vorschau für den ersten Sync nicht möglich", err);
+    } finally {
+      checking.hide();
+    }
+    // Unlinked, switched to another vault or confirmed elsewhere meanwhile: this check is out of date.
+    if (this.settings.backupAcknowledged || this.settings.linkedVault?.vaultId !== linked.vaultId) {
+      this.backupNoticeOpen = false;
+      return;
+    }
     new BackupNoticeModal(
       this.app,
+      linked.vaultName,
+      preview,
       () => this.acknowledgeBackup(),
       () => {
         this.backupNoticeOpen = false;
       },
     ).open();
+  }
+
+  /** Paths owned by ConfigSyncEngine (the config folder), which the file sync leaves alone. */
+  private isConfigPath(path: string): boolean {
+    return normalizePath(path).toLowerCase().startsWith(`${this.app.vault.configDir}/`.toLowerCase());
   }
 
   /** The user confirmed they have a backup (from the notice, the settings tab or the status menu): start syncing. */
@@ -377,13 +409,6 @@ export default class SyncstonePlugin extends Plugin {
       this.statusBar?.refresh();
       return;
     }
-    // Nothing is synced before the backup notice was confirmed.
-    if (!this.settings.backupAcknowledged) {
-      this.showBackupNotice();
-      this.statusBar?.refresh();
-      return;
-    }
-
     if (!this.cryptoService.isUnlocked()) {
       const remembered = await this.tryUnlockFromCache();
       if (!remembered) {
@@ -394,12 +419,18 @@ export default class SyncstonePlugin extends Plugin {
       }
     }
 
+    // Nothing is synced before the first-sync check was confirmed.
+    if (!this.settings.backupAcknowledged) {
+      void this.showBackupNotice();
+      this.statusBar?.refresh();
+      return;
+    }
+
     const linkedVault = this.settings.linkedVault;
     const localIndex = new LocalIndex(linkedVault.vaultId);
     await localIndex.open();
     this.localIndex = localIndex;
 
-    const configDirPrefix = `${this.app.vault.configDir}/`;
     const syncEngine = new SyncEngine({
       vaultId: linkedVault.vaultId,
       crypto: this.cryptoService,
@@ -408,7 +439,7 @@ export default class SyncstonePlugin extends Plugin {
       localIndex,
       isPaused: () => this.settings.syncPaused,
       mobileMaxFileBytes: () => (this.settings.mobileMaxFileMb > 0 ? this.settings.mobileMaxFileMb * 1024 * 1024 : Number.POSITIVE_INFINITY),
-      isConfigPath: (path) => normalizePath(path).toLowerCase().startsWith(configDirPrefix.toLowerCase()),
+      isConfigPath: (path) => this.isConfigPath(path),
       isCollabLive: (fileId) => this.collabManager?.isLive(fileId) ?? false,
       transfers: this.transfers,
       log: this.syncLog,
@@ -674,7 +705,7 @@ export default class SyncstonePlugin extends Plugin {
 
   async runManualSync(): Promise<void> {
     if (!this.settings.backupAcknowledged) {
-      this.showBackupNotice();
+      await this.tryStartSync(); // shows the first-sync check
       return;
     }
     if (!this.syncEngine) {

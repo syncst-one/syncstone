@@ -93,8 +93,9 @@ export interface SyncstoneSettings {
   cachedKeyMaterial: CachedKeyMaterial | null;
 
   /**
-   * The user confirmed the backup notice (sync tools can make mistakes: make a backup first). Nothing is synced before.
-   * Installs from before the notice existed count as confirmed.
+   * The user confirmed the check before the first sync of the linked vault (backup hint + what the sync would transfer,
+   * see BackupNoticeModal). Nothing is synced before. Linking a vault resets it; installs from before the notice existed
+   * count as confirmed.
    */
   backupAcknowledged: boolean;
 
