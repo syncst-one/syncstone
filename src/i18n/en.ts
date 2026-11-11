@@ -250,7 +250,7 @@ export const en = {
   "p.http.network": "Network request to {url} failed: {error}",
   "p.http.status": "Request to {path} failed (status {status}).",
   "p.collab.conflictCopy": "Syncstone: Your unsynced changes to \"{from}\" were saved as \"{to}\" because the note was merged live with another device.",
-  "p.sync.missingLocal": "Syncstone: {count} files are missing locally. To be safe they are restored from the server instead of being deleted there.",
+  "p.sync.missingLocal": "Syncstone: {count} files are missing here and will be downloaded again.",
   "p.sync.tooBigMobile": "Syncstone: \"{path}\" is too large to sync on mobile ({size}) and was skipped. You can raise the limit in the Syncstone settings.",
   "p.mobileLimit": "Largest file on this device",
   "p.mobileLimitDesc": "Phones and tablets skip files above this size: encrypting a large file needs several times its size in memory and has crashed the app on some Android devices. Raise it only if your device copes with it. Files that were skipped are synced after you change it.",

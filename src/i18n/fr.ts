@@ -251,7 +251,7 @@ export const fr: Partial<Record<MessageKey, string>> = {
   "p.http.network": "La requête réseau vers {url} a échoué : {error}",
   "p.http.status": "La requête vers {path} a échoué (statut {status}).",
   "p.collab.conflictCopy": "Syncstone : vos modifications non synchronisées de « {from} » ont été enregistrées sous « {to} », car la note a été fusionnée en direct avec un autre appareil.",
-  "p.sync.missingLocal": "Syncstone : {count} fichiers manquent en local. Par sécurité, ils sont restaurés depuis le serveur au lieu d'y être supprimés.",
+  "p.sync.missingLocal": "Syncstone : {count} fichiers manquent ici et seront téléchargés à nouveau.",
   "p.sync.tooBigMobile": "Syncstone : « {path} » est trop volumineux pour la synchronisation sur mobile ({size}) et a été ignoré. Vous pouvez augmenter la limite dans les réglages de Syncstone.",
   "p.mobileLimit": "Plus gros fichier sur cet appareil",
   "p.mobileLimitDesc": "Les téléphones et tablettes ignorent les fichiers plus gros que cette taille : chiffrer un gros fichier demande plusieurs fois sa taille en mémoire et a fait planter l'application sur certains appareils Android. Ne l'augmentez que si votre appareil le supporte. Les fichiers ignorés sont synchronisés après le changement.",

@@ -594,7 +594,7 @@ export class SyncEngine {
     const missing = tracked.filter((r) => !localByPath.has(r.localPath)).length;
     const allowLocalDeletes = missing <= 10 || missing <= tracked.length / 2;
     if (!allowLocalDeletes) {
-      console.warn(`Syncstone: ${missing} von ${tracked.length} Dateien fehlen lokal - sie werden wiederhergestellt statt gelöscht.`);
+      console.warn(`Syncstone: ${missing} von ${tracked.length} Dateien fehlen lokal - werden wieder heruntergeladen.`);
       new Notice(t("p.sync.missingLocal", { count: missing }));
     }
 

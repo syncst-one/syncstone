@@ -251,7 +251,7 @@ export const nl: Partial<Record<MessageKey, string>> = {
   "p.http.network": "Netwerkverzoek naar {url} mislukt: {error}",
   "p.http.status": "Verzoek naar {path} mislukt (status {status}).",
   "p.collab.conflictCopy": "Syncstone: je niet-gesynchroniseerde wijzigingen in \"{from}\" zijn opgeslagen als \"{to}\" omdat de notitie live met een ander apparaat is samengevoegd.",
-  "p.sync.missingLocal": "Syncstone: {count} bestanden ontbreken lokaal. Voor de zekerheid worden ze van de server hersteld in plaats van daar verwijderd.",
+  "p.sync.missingLocal": "Syncstone: {count} bestanden ontbreken hier en worden opnieuw gedownload.",
   "p.sync.tooBigMobile": "Syncstone: \"{path}\" is te groot om op mobiel te synchroniseren ({size}) en is overgeslagen. Je kunt de limiet verhogen in de Syncstone-instellingen.",
   "p.mobileLimit": "Grootste bestand op dit apparaat",
   "p.mobileLimitDesc": "Telefoons en tablets slaan bestanden boven deze grootte over: een groot bestand versleutelen vraagt een veelvoud van zijn grootte aan geheugen en heeft de app op sommige Android-apparaten laten crashen. Verhoog het alleen als je apparaat het aankan. Overgeslagen bestanden worden na een wijziging gesynchroniseerd.",

@@ -251,7 +251,7 @@ export const de: Partial<Record<MessageKey, string>> = {
   "p.http.network": "Netzwerkanfrage an {url} fehlgeschlagen: {error}",
   "p.http.status": "Anfrage an {path} fehlgeschlagen (Status {status}).",
   "p.collab.conflictCopy": "Syncstone: Deine ungesyncten Änderungen an \"{from}\" wurden als \"{to}\" gesichert, weil die Notiz live mit einem anderen Gerät zusammengeführt wurde.",
-  "p.sync.missingLocal": "Syncstone: {count} Dateien fehlen lokal. Zur Sicherheit werden sie vom Server wiederhergestellt statt dort gelöscht.",
+  "p.sync.missingLocal": "Syncstone: {count} Dateien fehlen hier und werden wieder heruntergeladen.",
   "p.sync.tooBigMobile": "Syncstone: „{path}“ ist zu groß für die Synchronisierung auf Mobile ({size}) und wurde übersprungen. Das Limit kannst du in den Syncstone-Einstellungen erhöhen.",
   "p.mobileLimit": "Größte Datei auf diesem Gerät",
   "p.mobileLimitDesc": "Handys und Tablets überspringen Dateien über dieser Größe: Eine große Datei zu verschlüsseln braucht ein Vielfaches ihrer Größe im Arbeitsspeicher und hat auf manchen Android-Geräten die App abstürzen lassen. Erhöhe den Wert nur, wenn dein Gerät damit klarkommt. Übersprungene Dateien werden nach einer Änderung synchronisiert.",
