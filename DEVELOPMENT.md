@@ -40,7 +40,8 @@ version. GitHub's "Latest" label plays no part in it.
 2. Deploy the production server first (it must stay compatible with the plugins already out there).
 3. Bump `version` in `manifest.json` and `package.json`; add it to `versions.json` only when `minAppVersion` changes.
 4. Tag that commit with exactly the version (`git tag 0.3.0 && git push origin 0.3.0`, no leading `v`).
-5. The workflow publishes the release. The release notes are the changelog: what users notice, including server-side
+5. The workflow publishes the release with `release-notes/<version>.md` as its text (written for users; without that
+   file GitHub's list of commits is used). The release notes are the changelog: what users notice, including server-side
    improvements since the last release (a server-only change gets no plugin release of its own).
 
 A tester on `0.3.0-beta.N` is not offered `0.3.0` by the directory (it compares versions its own way); BRAT updates them.
