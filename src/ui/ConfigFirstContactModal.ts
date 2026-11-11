@@ -1,7 +1,5 @@
 import { Modal, Setting, type App } from "obsidian";
-import { t, tn } from "../i18n/index.js";
-
-const SHOWN_PATHS = 6;
+import { t } from "../i18n/index.js";
 
 /**
  * Asked once when settings sync finds settings on this device that differ from the server's and were never synced
@@ -24,16 +22,6 @@ export class ConfigFirstContactModal extends Modal {
     const { contentEl } = this;
     this.titleEl.setText(t("p.configFirst.title"));
     contentEl.createEl("p", { text: t("p.configFirst.text") });
-
-    const list = contentEl.createEl("ul");
-    const prefix = `${this.configDir}/`;
-    for (const path of this.paths.slice(0, SHOWN_PATHS)) {
-      list.createEl("li", { text: path.startsWith(prefix) ? path.slice(prefix.length) : path });
-    }
-    const more = this.paths.length - SHOWN_PATHS;
-    if (more > 0) list.createEl("li", { text: tn("p.configFirst.more", more) });
-
-    contentEl.createEl("p", { text: t("p.configFirst.hint"), cls: "setting-item-description" });
 
     new Setting(contentEl)
       .addButton((button) => {
