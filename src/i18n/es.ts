@@ -292,6 +292,7 @@ export const es: Partial<Record<MessageKey, string>> = {
   "p.configFirst.hint": "Lo que solo existe en un lado se conserva. Esta pregunta aparece una sola vez.",
   "p.configFirst.remote": "De mis otros dispositivos",
   "p.configFirst.local": "De este dispositivo",
+  "p.configFirst.skip": "No sincronizar",
   "p.tip.pluginOutdated": "Syncstone: actualiza el plugin. Hasta entonces la sincronización está en pausa, tus cambios se conservan",
   "p.tip.serverOutdated": "Syncstone: el servidor necesita una actualización. Hasta entonces la sincronización está en pausa, tus cambios se conservan",
   "p.update.open": "Actualizar plugin",

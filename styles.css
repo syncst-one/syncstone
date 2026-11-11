@@ -726,3 +726,19 @@ details[open] > .syncstone-section-title::before {
   font-size: var(--font-ui-smaller);
   font-variant-numeric: tabular-nums;
 }
+
+/* A small, quiet choice next to the real ones (e.g. "Don't sync" in the settings question). */
+.syncstone-quiet-button,
+button.syncstone-quiet-button:not(.mod-cta) {
+  background: transparent;
+  box-shadow: none;
+  border: none;
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+  padding-inline: 6px;
+}
+
+.syncstone-quiet-button:hover {
+  color: var(--text-normal);
+  text-decoration: underline;
+}

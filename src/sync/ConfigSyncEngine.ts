@@ -51,10 +51,12 @@ export interface ConfigSyncEngineDeps {
   /**
    * Settings sync meets settings on this device that differ from the server's and were never synced before (it was just
    * switched on, or a category was added). Only the user knows which side is right, so they are asked once: "local" =
-   * this device's settings, "remote" = those of the other devices, null = not now (asked again at the next start).
-   * Without it the server's side is taken, as before.
+   * this device's settings, "remote" = those of the other devices, null = do not sync settings (dismissed, or "don't
+   * sync"). Without it the server's side is taken, as before.
    */
   chooseFirstContact?: (paths: string[]) => Promise<"local" | "remote" | null>;
+  /** The user declined the question: switch back off what was just switched on (nothing has been synced yet). */
+  onFirstContactDeclined?: () => void | Promise<void>;
 }
 
 /** Which side wins where both sides differ: the chosen one; for JSON settings the other side's extra entries are kept. */
@@ -100,7 +102,7 @@ export class ConfigSyncEngine {
   /** The answer to the first-contact question, used by the next run and then cleared. */
   private firstContactChoice: Side | null = null;
   private askingFirstContact = false;
-  /** "Not now" was chosen: settings are not synced for the rest of this Obsidian session. */
+  /** Declined without a way to switch settings sync off: not synced for the rest of this Obsidian session. */
   private firstContactPostponed = false;
 
   constructor(private readonly deps: ConfigSyncEngineDeps) {
@@ -241,6 +243,8 @@ export class ConfigSyncEngine {
       .then((choice) => {
         this.askingFirstContact = false;
         if (!choice) {
+          this.fullyListed = false;
+          if (this.deps.onFirstContactDeclined) return this.deps.onFirstContactDeclined();
           this.firstContactPostponed = true;
           return;
         }

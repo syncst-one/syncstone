@@ -292,6 +292,7 @@ export const nl: Partial<Record<MessageKey, string>> = {
   "p.configFirst.hint": "Wat maar aan één kant bestaat, blijft behouden. Deze vraag komt maar één keer.",
   "p.configFirst.remote": "Van mijn andere apparaten",
   "p.configFirst.local": "Van dit apparaat",
+  "p.configFirst.skip": "Niet synchroniseren",
   "p.tip.pluginOutdated": "Syncstone: werk de plugin bij. Tot dan is de synchronisatie gepauzeerd, je wijzigingen blijven bewaard",
   "p.tip.serverOutdated": "Syncstone: de server heeft een update nodig. Tot dan is de synchronisatie gepauzeerd, je wijzigingen blijven bewaard",
   "p.update.open": "Plugin bijwerken",

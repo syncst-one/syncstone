@@ -67,6 +67,8 @@ export default class SyncstonePlugin extends Plugin {
   /** What the sync did (the "Sync log" dialog); lives as long as the plugin, across unlink / relink. */
   syncLog!: SyncLog;
   private progressRings!: ExplorerProgressRings;
+  /** The settings-sync switch the user flipped on last ("enabled" = the main one), so declining the first-contact question can flip exactly that one back. */
+  lastConfigToggle: "enabled" | "coreSettings" | "communityPlugins" | "themes" | "snippets" | "hotkeys" | "workspace" | null = null;
   /** Whether plugin and server fit together, and whether a newer plugin is out (see checkCompat). */
   compat: CompatInfo = COMPAT_UNKNOWN;
   /** The last compat result that was shown to the user, so the same hint is not repeated within one Obsidian start. */
@@ -475,6 +477,16 @@ export default class SyncstonePlugin extends Plugin {
       },
       chooseFirstContact: (paths) =>
         new Promise((resolve) => new ConfigFirstContactModal(this.app, paths, this.app.vault.configDir, resolve).open()),
+      onFirstContactDeclined: async () => {
+        // Switch back off what was just switched on: the category toggled last, else settings sync as a whole.
+        const config = this.settings.configSync;
+        const last = this.lastConfigToggle;
+        if (last && last !== "enabled") config[last] = false;
+        else config.enabled = false;
+        this.lastConfigToggle = null;
+        await this.saveSettings();
+        this.settingsTab?.display();
+      },
     });
 
     this.registerEvent(this.app.vault.on("create", (file) => syncEngine.handleLocalEvent("create", file)));

@@ -5,8 +5,8 @@ const SHOWN_PATHS = 6;
 
 /**
  * Asked once when settings sync finds settings on this device that differ from the server's and were never synced
- * before (it was just switched on, or a category was added): which side should count. Closing it means "not now";
- * settings then stay unsynced until the next start of Obsidian, where it asks again.
+ * before (it was just switched on, or a category was added): which side should count. "Don't sync", or closing it
+ * without a choice, switches back off what was just switched on; nothing has been synced at that point.
  */
 export class ConfigFirstContactModal extends Modal {
   private answered = false;
@@ -36,6 +36,10 @@ export class ConfigFirstContactModal extends Modal {
     contentEl.createEl("p", { text: t("p.configFirst.hint"), cls: "setting-item-description" });
 
     new Setting(contentEl)
+      .addButton((button) => {
+        button.setButtonText(t("p.configFirst.skip")).onClick(() => this.close());
+        button.buttonEl.addClass("syncstone-quiet-button");
+      })
       .addButton((button) => button.setButtonText(t("p.configFirst.remote")).onClick(() => this.answer("remote")))
       .addButton((button) => button.setButtonText(t("p.configFirst.local")).setCta().onClick(() => this.answer("local")));
   }

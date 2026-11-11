@@ -936,6 +936,7 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(config.enabled).onChange(async (value) => {
           config.enabled = value;
+          this.plugin.lastConfigToggle = value ? "enabled" : null;
           if (value) this.openSections.add("config-categories"); // show the choices right away
           await this.plugin.saveSettings();
           if (value) void this.plugin.configSyncEngine?.run().catch((err) => console.error("Syncstone: Einstellungs-Sync fehlgeschlagen", err));
@@ -980,6 +981,7 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
         .addToggle((toggle) =>
           toggle.setValue(config[category.key]).onChange(async (value) => {
             config[category.key] = value;
+            this.plugin.lastConfigToggle = value ? category.key : null;
             await this.plugin.saveSettings();
             void this.plugin.configSyncEngine?.run().catch((err) => console.error("Syncstone: Einstellungs-Sync fehlgeschlagen", err));
             // Keep the "n von 6 aktiv" hint current without collapsing the dropdown.

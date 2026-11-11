@@ -291,6 +291,7 @@ export const en = {
   "p.configFirst.hint": "Entries that exist on only one side are kept. You are asked only this once.",
   "p.configFirst.remote": "From my other devices",
   "p.configFirst.local": "From this device",
+  "p.configFirst.skip": "Don't sync",
   "p.tip.pluginOutdated": "Syncstone: please update the plugin. Sync is paused until then, your changes are kept",
   "p.tip.serverOutdated": "Syncstone: the server needs an update. Sync is paused until then, your changes are kept",
   "p.update.open": "Update plugin",
