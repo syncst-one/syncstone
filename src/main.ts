@@ -382,8 +382,8 @@ export default class SyncstonePlugin extends Plugin {
     if (key === this.compatAnnounced) return;
     this.compatAnnounced = key;
     this.statusBar?.refresh();
-    if (state === "plugin-outdated") new Notice(t("p.update.required"), 0);
-    else if (state === "server-outdated") new Notice(this.isSelfHosted() ? t("p.update.serverOutdated") : t("p.update.serverBusy"), 0);
+    if (state === "plugin-outdated") new Notice(t("p.update.requiredNotice"), 0);
+    else if (state === "server-outdated") new Notice(this.isSelfHosted() ? t("p.update.serverNotice") : t("p.update.serverBusy"), 0);
     else if (updateAvailable) new Notice(t("p.update.available", { version: updateAvailable }), 15_000);
   }
 

@@ -103,6 +103,10 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
         tone = "warn";
         icon = "unlink";
         text = t("p.hero.noVault");
+      } else if (this.plugin.compat.state === "plugin-outdated" || this.plugin.compat.state === "server-outdated") {
+        tone = "warn";
+        icon = "circle-arrow-up";
+        text = t(this.plugin.compat.state === "plugin-outdated" ? "p.hero.updateRequired" : "p.hero.serverUpdateRequired");
       } else if (!this.plugin.cryptoService.isUnlocked()) {
         tone = "warn";
         icon = "lock";
