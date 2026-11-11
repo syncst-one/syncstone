@@ -31,10 +31,7 @@ export class BackupNoticeModal extends Modal {
       const rows: string[] = [];
       if (preview.download > 0) rows.push(tn("p.firstSync.download", preview.download));
       if (preview.upload > 0) rows.push(tn("p.firstSync.upload", preview.upload));
-      if (preview.same > 0) rows.push(tn("p.firstSync.same", preview.same));
-      if (preview.differ > 0) rows.push(tn("p.firstSync.differ", preview.differ));
-      if (rows.length === 0) contentEl.createEl("p", { text: t("p.firstSync.nothing") });
-      else {
+      if (rows.length > 0) {
         const list = contentEl.createEl("ul");
         for (const row of rows) list.createEl("li", { text: row });
       }
