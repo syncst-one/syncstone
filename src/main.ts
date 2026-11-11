@@ -27,6 +27,7 @@ import { PublishService } from "./publish/PublishService.js";
 import { PublishModal } from "./ui/PublishModal.js";
 import { SyncLogModal } from "./ui/SyncLogModal.js";
 import { BackupNoticeModal } from "./ui/BackupNoticeModal.js";
+import { ConfigFirstContactModal } from "./ui/ConfigFirstContactModal.js";
 import { previewFirstSync, type FirstSyncPreview } from "./sync/firstSyncPreview.js";
 import { HISTORY_DIFF_VIEW_TYPE, HistoryDiffView } from "./ui/HistoryDiffView.js";
 
@@ -472,6 +473,8 @@ export default class SyncstonePlugin extends Plugin {
         this.settings.configSync.lastSyncedGlobalVersion = version;
         await this.saveSettings();
       },
+      chooseFirstContact: (paths) =>
+        new Promise((resolve) => new ConfigFirstContactModal(this.app, paths, this.app.vault.configDir, resolve).open()),
     });
 
     this.registerEvent(this.app.vault.on("create", (file) => syncEngine.handleLocalEvent("create", file)));

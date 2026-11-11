@@ -48,7 +48,17 @@ export interface ConfigSyncEngineDeps {
   getSettings: () => ConfigSyncSettings;
   log?: SyncLog;
   onLastVersionChange: (version: number) => void | Promise<void>;
+  /**
+   * Settings sync meets settings on this device that differ from the server's and were never synced before (it was just
+   * switched on, or a category was added). Only the user knows which side is right, so they are asked once: "local" =
+   * this device's settings, "remote" = those of the other devices, null = not now (asked again at the next start).
+   * Without it the server's side is taken, as before.
+   */
+  chooseFirstContact?: (paths: string[]) => Promise<"local" | "remote" | null>;
 }
+
+/** Which side wins where both sides differ: the chosen one; for JSON settings the other side's extra entries are kept. */
+type Side = "local" | "remote";
 
 /** Category -> the `.obsidian`-relative files/folders it covers. Folders are scanned recursively. */
 function categoryRoots(configDir: string): Record<ConfigCategory, string[]> {
@@ -87,6 +97,11 @@ export class ConfigSyncEngine {
   /** The first run of a session, and every run after the set of synced categories changed, compares against the whole remote list. */
   private fullyListed = false;
   private lastRootsKey = "";
+  /** The answer to the first-contact question, used by the next run and then cleared. */
+  private firstContactChoice: Side | null = null;
+  private askingFirstContact = false;
+  /** "Not now" was chosen: settings are not synced for the rest of this Obsidian session. */
+  private firstContactPostponed = false;
 
   constructor(private readonly deps: ConfigSyncEngineDeps) {
     this.configDir = deps.app.vault.configDir;
@@ -98,7 +113,7 @@ export class ConfigSyncEngine {
 
   async run(): Promise<void> {
     const settings = this.deps.getSettings();
-    if (!settings.enabled || this.syncing) return;
+    if (!settings.enabled || this.syncing || this.askingFirstContact || this.firstContactPostponed) return;
 
     this.syncing = true;
     try {
@@ -150,6 +165,26 @@ export class ConfigSyncEngine {
       remoteByPath.set(path, item);
     }
 
+    // Settings that differ between this device and the server and were never synced before: ask which side is right
+    // before touching anything (see `chooseFirstContact`).
+    const firstContact = new Set<string>();
+    for (const [path, item] of remoteByPath) {
+      if (item.isDeleted || settings.known[this.knownKey(path)] !== undefined || !localFiles.has(path)) continue;
+      const category = this.categoryFor(path, roots);
+      if (!category || !settings[category]) continue;
+      const localHash = toBase64(await this.deps.crypto.hashContent(new Uint8Array(await this.deps.app.vault.adapter.readBinary(path))));
+      if (localHash !== toBase64(item.contentHashBlinded)) firstContact.add(path);
+    }
+    let firstContactSide: Side = "remote";
+    if (firstContact.size > 0 && this.deps.chooseFirstContact) {
+      if (!this.firstContactChoice) {
+        this.askFirstContact([...firstContact]);
+        return; // nothing is synced until the question is answered; the answer starts the next run
+      }
+      firstContactSide = this.firstContactChoice;
+    }
+    this.firstContactChoice = null;
+
     const handled = new Set<string>();
 
     for (const [path, item] of remoteByPath) {
@@ -179,7 +214,7 @@ export class ConfigSyncEngine {
         continue;
       }
 
-      await this.reconcilePath(settings, path, item, localFiles.get(path));
+      await this.reconcilePath(settings, path, item, localFiles.get(path), firstContact.has(path) ? firstContactSide : null);
     }
 
     for (const [path, { mtime }] of localFiles) {
@@ -198,11 +233,39 @@ export class ConfigSyncEngine {
     await this.deps.onLastVersionChange(newVersion);
   }
 
+  private askFirstContact(paths: string[]): void {
+    const ask = this.deps.chooseFirstContact;
+    if (!ask) return;
+    this.askingFirstContact = true;
+    void ask(paths)
+      .then((choice) => {
+        this.askingFirstContact = false;
+        if (!choice) {
+          this.firstContactPostponed = true;
+          return;
+        }
+        this.firstContactChoice = choice;
+        this.fullyListed = false; // the next run looks at everything again, with the answer
+        // After the run that asked has fully finished (an immediate answer would otherwise find it still running).
+        window.setTimeout(() => {
+          this.run().catch((err) => console.error("Syncstone: Einstellungen konnten nicht abgeglichen werden", err));
+        }, 0);
+      })
+      .catch((err) => {
+        this.askingFirstContact = false;
+        console.error("Syncstone: Einstellungen konnten nicht abgeglichen werden", err);
+      });
+  }
+
+  /**
+   * `firstContact`: this file differs from the server's and was never synced before; the user chose which side wins.
+   */
   private async reconcilePath(
     settings: ConfigSyncSettings,
     path: string,
     item: DecodedFileListItem,
     local: { mtime: number } | undefined,
+    firstContact: Side | null = null,
   ): Promise<void> {
     const remoteHash = toBase64(item.contentHashBlinded);
     if (!local) {
@@ -220,9 +283,18 @@ export class ConfigSyncEngine {
     }
 
     // `baseline` is what this device and the server last agreed on. With it the side that changed since then is clear,
-    // regardless of file times; without it (first contact, e.g. a new device that still has default settings) the
-    // server's version is adopted rather than a fresh device overwriting the real settings because its files are newer.
+    // regardless of file times. Without it (first contact) the user's answer decides (see `chooseFirstContact`); with no
+    // way to ask, the server's version is adopted rather than a fresh device overwriting the real settings.
     const baseline = settings.known[this.knownKey(path)];
+    if (baseline === undefined && firstContact) {
+      await this.settleBothSides(settings, path, item, localBytes, firstContact);
+      return;
+    }
+    if (baseline !== undefined && baseline !== remoteHash && baseline !== localB64 && isJsonPath(path)) {
+      // Both sides changed the same settings file: like Obsidian Sync, the entries are combined, this device's on top.
+      await this.settleBothSides(settings, path, item, localBytes, "local");
+      return;
+    }
     let download: boolean;
     if (baseline === undefined) download = true;
     else if (baseline === remoteHash) download = false;
@@ -236,6 +308,49 @@ export class ConfigSyncEngine {
       if (hash) this.remember(settings, path, hash);
       this.reconciledMtimes.set(path, local.mtime);
     }
+  }
+
+  /**
+   * Both sides have their own version of a settings file and `winner` should win. A JSON object is combined: every entry
+   * of the winner, plus the entries only the other side has (Obsidian Sync does the same); anything else is taken whole
+   * from the winner. The result ends up on both sides.
+   */
+  private async settleBothSides(settings: ConfigSyncSettings, path: string, item: DecodedFileListItem, localBytes: Uint8Array, winner: Side): Promise<void> {
+    let merged: Uint8Array | null = null;
+    if (isJsonPath(path)) {
+      const remoteBytes = await this.fetchRemote(item);
+      if (remoteBytes) merged = mergeJsonSettings(localBytes, remoteBytes, winner);
+    }
+    if (!merged) {
+      if (winner === "remote") {
+        if (await this.downloadPath(path, item)) settings.known[this.knownKey(path)] = toBase64(item.contentHashBlinded);
+      } else {
+        const hash = await this.uploadPath(path, localBytes);
+        if (hash) this.remember(settings, path, hash);
+        this.reconciledMtimes.set(path, await this.statMtime(path));
+      }
+      return;
+    }
+    const mergedHash = await this.deps.crypto.hashContent(merged);
+    if (toBase64(mergedHash) === toBase64(item.contentHashBlinded)) {
+      // The combination is exactly the server's version: just take it over.
+      if (await this.downloadPath(path, item)) settings.known[this.knownKey(path)] = toBase64(item.contentHashBlinded);
+      return;
+    }
+    if (!sameBytes(merged, localBytes)) {
+      await this.deps.app.vault.adapter.writeBinary(path, toArrayBuffer(merged));
+      this.deps.log?.add({ kind: "settings-down", path });
+    }
+    const hash = await this.uploadPath(path, merged, mergedHash);
+    if (hash) this.remember(settings, path, hash);
+    this.reconciledMtimes.set(path, await this.statMtime(path));
+  }
+
+  private async fetchRemote(item: DecodedFileListItem): Promise<Uint8Array | null> {
+    if (Platform.isMobile && item.contentSize > MOBILE_MAX_SYNC_FILE_SIZE_BYTES) return null;
+    const blob = await this.deps.remote.downloadBlob(this.deps.vaultId, item.id, item.contentSize);
+    const { ciphertext, iv } = unpackBlob(blob);
+    return this.deps.crypto.decryptContent(ciphertext, iv);
   }
 
   private async uploadPath(path: string, precomputedBytes?: Uint8Array, precomputedHash?: Uint8Array): Promise<Uint8Array | null> {
@@ -348,6 +463,41 @@ export class ConfigSyncEngine {
   private isRemoteNewer(remoteUpdatedAt: string, localMtimeMs: number): boolean {
     return new Date(remoteUpdatedAt).getTime() >= localMtimeMs;
   }
+}
+
+function isJsonPath(path: string): boolean {
+  return path.toLowerCase().endsWith(".json");
+}
+
+function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
+  if (a.byteLength !== b.byteLength) return false;
+  for (let i = 0; i < a.byteLength; i++) if (a[i] !== b[i]) return false;
+  return true;
+}
+
+/**
+ * Combines two versions of a JSON settings file: all top-level entries of `winner`'s side, plus the ones only the other
+ * side has. Null when either side is not a JSON object (lists such as community-plugins.json are taken whole instead:
+ * combining them would switch back on what one device switched off).
+ */
+export function mergeJsonSettings(localBytes: Uint8Array, remoteBytes: Uint8Array, winner: Side): Uint8Array | null {
+  const parse = (bytes: Uint8Array): Record<string, unknown> | null => {
+    try {
+      const value: unknown = JSON.parse(new TextDecoder().decode(bytes));
+      return value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : null;
+    } catch {
+      return null;
+    }
+  };
+  const local = parse(localBytes);
+  const remote = parse(remoteBytes);
+  if (!local || !remote) return null;
+  const merged = winner === "local" ? { ...remote, ...local } : { ...local, ...remote };
+  const winnerBytes = winner === "local" ? localBytes : remoteBytes;
+  const winnerObject = winner === "local" ? local : remote;
+  // Nothing added from the other side: keep the winner's file exactly as it is (no reformatting).
+  if (Object.keys(merged).length === Object.keys(winnerObject).length) return winnerBytes;
+  return new TextEncoder().encode(JSON.stringify(merged, null, 2));
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
