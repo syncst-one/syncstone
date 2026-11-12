@@ -174,8 +174,9 @@ export class ConfigSyncEngine {
       if (item.isDeleted || settings.known[this.knownKey(path)] !== undefined || !localFiles.has(path)) continue;
       const category = this.categoryFor(path, roots);
       if (!category || !settings[category]) continue;
-      const localHash = toBase64(await this.deps.crypto.hashContent(new Uint8Array(await this.deps.app.vault.adapter.readBinary(path))));
-      if (localHash !== toBase64(item.contentHashBlinded)) firstContact.add(path);
+      const localBytes = await this.readLocal(path);
+      if (!localBytes) continue; // removed meanwhile (e.g. a plugin being uninstalled): nothing to compare
+      if (toBase64(await this.deps.crypto.hashContent(localBytes)) !== toBase64(item.contentHashBlinded)) firstContact.add(path);
     }
     let firstContactSide: Side = "remote";
     if (firstContact.size > 0 && this.deps.chooseFirstContact) {
@@ -277,7 +278,8 @@ export class ConfigSyncEngine {
       return;
     }
 
-    const localBytes = await this.deps.app.vault.adapter.readBinary(path).then((b) => new Uint8Array(b));
+    const localBytes = await this.readLocal(path);
+    if (!localBytes) return; // removed while syncing (e.g. a plugin being uninstalled): the next run sees it as missing
     const localHash = await this.deps.crypto.hashContent(localBytes);
     const localB64 = toBase64(localHash);
     if (localB64 === remoteHash) {
@@ -358,7 +360,8 @@ export class ConfigSyncEngine {
   }
 
   private async uploadPath(path: string, precomputedBytes?: Uint8Array, precomputedHash?: Uint8Array): Promise<Uint8Array | null> {
-    const bytes = precomputedBytes ?? new Uint8Array(await this.deps.app.vault.adapter.readBinary(path));
+    const bytes = precomputedBytes ?? (await this.readLocal(path));
+    if (!bytes) return null; // removed while syncing: nothing to upload
 
     if (Platform.isMobile && bytes.byteLength > MOBILE_MAX_SYNC_FILE_SIZE_BYTES) {
       if (!this.warnedOversizedPaths.has(path)) {
@@ -432,6 +435,19 @@ export class ConfigSyncEngine {
     const listing = await adapter.list(path);
     for (const filePath of listing.files) await this.walk(filePath, out);
     for (const folderPath of listing.folders) await this.walk(folderPath, out);
+  }
+
+  /**
+   * The bytes of a local settings file, or null when it is gone by now. Plugins are installed, updated and removed while
+   * the sync runs; a file that vanished between listing and reading must not abort the whole run ("File does not exist").
+   */
+  private async readLocal(path: string): Promise<Uint8Array | null> {
+    try {
+      return new Uint8Array(await this.deps.app.vault.adapter.readBinary(path));
+    } catch (err) {
+      if (!(await this.deps.app.vault.adapter.exists(path))) return null;
+      throw err;
+    }
   }
 
   private async statMtime(path: string): Promise<number> {
