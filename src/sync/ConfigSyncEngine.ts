@@ -37,7 +37,7 @@ import type { DecodedFileListItem, RemoteApiClient } from "./RemoteApiClient.js"
 import type { SyncLog } from "./SyncLog.js";
 import { errorArgs } from "./errorArgs.js";
 
-type ConfigCategory = Exclude<keyof ConfigSyncSettings, "enabled" | "lastSyncedGlobalVersion" | "known">;
+type ConfigCategory = Exclude<keyof ConfigSyncSettings, "enabled" | "lastSyncedGlobalVersion" | "known" | "rejoin">;
 
 export interface ConfigSyncEngineDeps {
   app: App;
@@ -147,21 +147,17 @@ export class ConfigSyncEngine {
       .filter((cat) => settings[cat])
       .flatMap((cat) => roots[cat]);
 
-    // A category that is switched off syncs nothing on this device. What it last agreed on is forgotten, so switching it
-    // on again compares from scratch (and asks if needed) instead of reading what changed meanwhile as deletions.
     const knownPrefix = `${this.deps.vaultId}|`;
-    for (const key of Object.keys(settings.known)) {
-      if (!key.startsWith(knownPrefix)) continue;
-      const category = this.categoryFor(key.slice(knownPrefix.length), roots);
-      if (!category || !settings[category]) delete settings.known[key];
-    }
+    // Categories that were off and are on again: their first sync only fetches and adds (see `ConfigSyncSettings.rejoin`).
+    const rejoining = new Set(settings.rejoin ?? []);
 
     const localFiles = await this.scanLocal(enabledRootPaths);
 
     // Without the full list a local file that is missing from the delta could be one the server already has (from
     // before this session, or from a category that was just switched on) and would be uploaded over it blindly.
     const rootsKey = enabledRootPaths.join("|");
-    const fullList = !this.fullyListed || rootsKey !== this.lastRootsKey;
+    // The first sync after switching a category on again needs the whole list as well: it has to see every file.
+    const fullList = !this.fullyListed || rootsKey !== this.lastRootsKey || rejoining.size > 0;
     const remoteResp = await this.deps.remote.listFiles(this.deps.vaultId, fullList ? 0 : settings.lastSyncedGlobalVersion, true);
     const configPrefix = `${this.configDir}/`;
     const remoteByPath = new Map<string, DecodedFileListItem>();
@@ -253,13 +249,27 @@ export class ConfigSyncEngine {
       if (!key.startsWith(knownPrefix)) continue;
       const path = key.slice(knownPrefix.length);
       if (handled.has(path) || localFiles.has(path)) continue;
+      const category = this.categoryFor(path, roots);
+      if (!category || !settings[category]) continue; // switched off here: kept as it is, not acted on
       if (fullList || !this.isDeletable(path)) {
         this.forget(settings, path);
         continue;
       }
       deletedHere.push({ path, item: null });
     }
-    await this.applyDeletedHere(settings, deletedHere);
+    // Missing here in a category that was just switched on again: fetched, never deleted elsewhere.
+    const toDelete: typeof deletedHere = [];
+    for (const entry of deletedHere) {
+      const category = this.categoryFor(entry.path, roots);
+      if (category && rejoining.has(category)) {
+        if (entry.item && (await this.downloadPath(entry.path, entry.item))) {
+          settings.known[this.knownKey(entry.path)] = toBase64(entry.item.contentHashBlinded);
+        }
+      } else toDelete.push(entry);
+    }
+    await this.applyDeletedHere(settings, toDelete);
+    // The first sync after switching on went through: from now on deletions travel again.
+    if (settings.rejoin?.length) settings.rejoin = settings.rejoin.filter((category) => !settings[category as ConfigCategory] || !settings.enabled);
 
     for (const [path, { mtime }] of localFiles) {
       if (handled.has(path)) continue;

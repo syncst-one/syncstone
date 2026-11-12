@@ -488,10 +488,12 @@ export default class SyncstonePlugin extends Plugin {
         // Switch back off what was just switched on: the category toggled last, else settings sync as a whole.
         const config = this.settings.configSync;
         const last = this.lastConfigToggle;
-        if (last && last !== "enabled") config[last] = false;
-        else {
+        if (last && last !== "enabled") {
+          config[last] = false;
+          config.rejoin = [...new Set([...(config.rejoin ?? []), last])];
+        } else {
           config.enabled = false;
-          config.known = {};
+          config.rejoin = ["coreSettings", "communityPlugins", "themes", "snippets", "hotkeys", "workspace"];
         }
         this.lastConfigToggle = null;
         await this.saveSettings();

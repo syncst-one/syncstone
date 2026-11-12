@@ -69,6 +69,12 @@ export interface ConfigSyncSettings {
    * (a new device with default settings) is not in it: there the server's version is taken over, never overwritten.
    */
   known: Record<string, string>;
+  /**
+   * Categories that were switched off (or settings sync as a whole) and are being switched on again. While off, this
+   * device did what it liked; so the first sync after switching on only fetches and adds, it never reads files missing
+   * here as deletions for the other devices. Cleared once that first sync went through. Optional: older settings lack it.
+   */
+  rejoin?: string[];
   /** This device's last-applied vault-wide version for config files specifically - a separate cursor from `linkedVault.lastSyncedGlobalVersion`, since the two engines poll independently. */
   lastSyncedGlobalVersion: number;
 }
