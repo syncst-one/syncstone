@@ -44,8 +44,8 @@ export interface CachedKeyMaterial {
 
 /**
  * Optional sync of `.obsidian/*` config files (plugins, themes, snippets,
- * hotkeys, core settings, workspace layout) - like Obsidian Sync's own
- * per-vault settings toggles. Off by default: existing users shouldn't
+ * hotkeys, core settings, workspace layout), one switch per category.
+ * Off by default: existing users shouldn't
  * suddenly start syncing plugin code/settings without opting in. Handled by
  * a completely separate ConfigSyncEngine, not the main note SyncEngine - see
  * that file for why.
@@ -60,8 +60,7 @@ export interface ConfigSyncSettings {
   /**
    * Workspace layout (open tabs/panes) is device-specific by nature (a
    * phone's layout doesn't make sense on a desktop) - default OFF even
-   * though the rest of config sync may be on, matching Obsidian Sync's own
-   * choice to exclude it by default.
+   * though the rest of config sync may be on.
    */
   workspace: boolean;
   /**
@@ -143,7 +142,9 @@ export const DEFAULT_SETTINGS: SyncstoneSettings = {
   configSync: {
     enabled: false,
     coreSettings: true,
-    communityPlugins: true,
+    // Off until chosen: plugins differ between devices (desktop-only ones, different sets on the phone), and their
+    // folders carry the most files.
+    communityPlugins: false,
     themes: true,
     snippets: true,
     hotkeys: true,

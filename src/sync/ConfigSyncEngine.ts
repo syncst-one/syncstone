@@ -1,7 +1,7 @@
 /**
  * Syncs `.obsidian/*` config files (core settings, community plugins,
- * themes, snippets, hotkeys, workspace layout) - like Obsidian Sync's own
- * per-vault settings toggles. Off by default (see `ConfigSyncSettings` in
+ * themes, snippets, hotkeys, workspace layout), with one switch per
+ * category. Off by default (see `ConfigSyncSettings` in
  * types.ts).
  *
  * Deliberately a SEPARATE engine from the main `SyncEngine`, not a mode of
@@ -297,7 +297,7 @@ export class ConfigSyncEngine {
       return;
     }
     if (baseline !== undefined && baseline !== remoteHash && baseline !== localB64 && isJsonPath(path)) {
-      // Both sides changed the same settings file: like Obsidian Sync, the entries are combined, this device's on top.
+      // Both sides changed the same settings file: the entries are combined, this device's on top.
       await this.settleBothSides(settings, path, item, localBytes, "local");
       return;
     }
@@ -318,7 +318,7 @@ export class ConfigSyncEngine {
 
   /**
    * Both sides have their own version of a settings file and `winner` should win. A JSON object is combined: every entry
-   * of the winner, plus the entries only the other side has (Obsidian Sync does the same); anything else is taken whole
+   * of the winner, plus the entries only the other side has; anything else is taken whole
    * from the winner. The result ends up on both sides.
    */
   private async settleBothSides(settings: ConfigSyncSettings, path: string, item: DecodedFileListItem, localBytes: Uint8Array, winner: Side): Promise<void> {

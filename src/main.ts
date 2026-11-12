@@ -342,6 +342,12 @@ export default class SyncstonePlugin extends Plugin {
       const own = normalizeServerUrl(stored.serverUrl ?? "");
       this.settings.selfHosted = own !== "" && own !== normalizeServerUrl(HOSTED_SERVER_URL);
     }
+    // Settings sync that was never used yet starts with community plugins off, like a new install; who already syncs
+    // settings keeps their choice.
+    const config = stored.configSync;
+    if (config && !config.enabled && Object.keys(config.known ?? {}).length === 0) {
+      this.settings.configSync = { ...config, communityPlugins: false };
+    }
     // Installs from before the backup notice existed already sync: it does not stop them.
     if (stored.backupAcknowledged === undefined && (stored.sessionToken || stored.linkedVault)) this.settings.backupAcknowledged = true;
   }
