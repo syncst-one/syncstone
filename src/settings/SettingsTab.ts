@@ -936,6 +936,9 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
       .addToggle((toggle) =>
         toggle.setValue(config.enabled).onChange(async (value) => {
           config.enabled = value;
+          // Off means this device is on its own: what it agreed on is forgotten, so switching on again compares from
+          // scratch instead of reading changes made meanwhile (an uninstalled plugin) as deletions for all devices.
+          if (!value) config.known = {};
           this.plugin.lastConfigToggle = value ? "enabled" : null;
           if (value) this.openSections.add("config-categories"); // show the choices right away
           await this.plugin.saveSettings();

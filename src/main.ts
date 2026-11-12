@@ -489,7 +489,10 @@ export default class SyncstonePlugin extends Plugin {
         const config = this.settings.configSync;
         const last = this.lastConfigToggle;
         if (last && last !== "enabled") config[last] = false;
-        else config.enabled = false;
+        else {
+          config.enabled = false;
+          config.known = {};
+        }
         this.lastConfigToggle = null;
         await this.saveSettings();
         this.settingsTab?.display();

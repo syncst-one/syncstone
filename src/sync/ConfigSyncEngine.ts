@@ -147,6 +147,15 @@ export class ConfigSyncEngine {
       .filter((cat) => settings[cat])
       .flatMap((cat) => roots[cat]);
 
+    // A category that is switched off syncs nothing on this device. What it last agreed on is forgotten, so switching it
+    // on again compares from scratch (and asks if needed) instead of reading what changed meanwhile as deletions.
+    const knownPrefix = `${this.deps.vaultId}|`;
+    for (const key of Object.keys(settings.known)) {
+      if (!key.startsWith(knownPrefix)) continue;
+      const category = this.categoryFor(key.slice(knownPrefix.length), roots);
+      if (!category || !settings[category]) delete settings.known[key];
+    }
+
     const localFiles = await this.scanLocal(enabledRootPaths);
 
     // Without the full list a local file that is missing from the delta could be one the server already has (from
@@ -189,6 +198,7 @@ export class ConfigSyncEngine {
     this.firstContactChoice = null;
 
     const handled = new Set<string>();
+    const deletedHere: Array<{ path: string; item: DecodedFileListItem | null }> = [];
 
     for (const [path, item] of remoteByPath) {
       handled.add(path);
@@ -203,12 +213,23 @@ export class ConfigSyncEngine {
           continue;
         }
         // Never agreed on this file with the server: a deletion there is not ours to apply (nor is the file ours to push).
-        if (settings.known[this.knownKey(path)] === undefined) continue;
-        const localMtime = await this.statMtime(path);
-        if (this.isRemoteNewer(item.updatedAt, localMtime)) {
-          await this.deps.app.vault.adapter.remove(path).catch(() => undefined);
+        const knownHash = settings.known[this.knownKey(path)];
+        if (knownHash === undefined) continue;
+        const localBytes = await this.readLocal(path);
+        if (!localBytes) {
           this.reconciledMtimes.delete(path);
           this.forget(settings, path);
+          continue;
+        }
+        // Deleted on another device. Unchanged here since the last sync: the delete is the only change and wins, whatever
+        // the clocks say (as for notes). Changed here as well: the newer side wins.
+        const unchangedHere = toBase64(await this.deps.crypto.hashContent(localBytes)) === knownHash;
+        if (unchangedHere || this.isRemoteNewer(item.updatedAt, await this.statMtime(path))) {
+          await this.deps.app.vault.adapter.remove(path).catch(() => undefined);
+          await this.pruneEmptyFolders(path);
+          this.reconciledMtimes.delete(path);
+          this.forget(settings, path);
+          this.deps.log?.add({ kind: "delete-down", path });
         } else {
           const hash = await this.uploadPath(path);
           if (hash) this.remember(settings, path, hash);
@@ -217,8 +238,28 @@ export class ConfigSyncEngine {
         continue;
       }
 
-      await this.reconcilePath(settings, path, item, localFiles.get(path), firstContact.has(path) ? firstContactSide : null);
+      const local = localFiles.get(path);
+      if (!local && this.isDeletable(path) && settings.known[this.knownKey(path)] === toBase64(item.contentHashBlinded)) {
+        // Synced before, gone here now, and nobody changed it since: it was deleted here (e.g. a plugin uninstalled).
+        deletedHere.push({ path, item });
+        continue;
+      }
+      await this.reconcilePath(settings, path, item, local, firstContact.has(path) ? firstContactSide : null);
     }
+
+    // Files this device synced before that are gone here and did not change on the server (so they are not in a delta
+    // list): deleted here as well. On a full list the server simply does not have them any more.
+    for (const key of Object.keys(settings.known)) {
+      if (!key.startsWith(knownPrefix)) continue;
+      const path = key.slice(knownPrefix.length);
+      if (handled.has(path) || localFiles.has(path)) continue;
+      if (fullList || !this.isDeletable(path)) {
+        this.forget(settings, path);
+        continue;
+      }
+      deletedHere.push({ path, item: null });
+    }
+    await this.applyDeletedHere(settings, deletedHere);
 
     for (const [path, { mtime }] of localFiles) {
       if (handled.has(path)) continue;
@@ -435,6 +476,79 @@ export class ConfigSyncEngine {
     const listing = await adapter.list(path);
     for (const filePath of listing.files) await this.walk(filePath, out);
     for (const folderPath of listing.folders) await this.walk(folderPath, out);
+  }
+
+  /**
+   * Deletions travel only for what lives in a subfolder of the settings folder: plugins, themes, snippets. Obsidian's own
+   * settings files (app.json, appearance.json, hotkeys.json, the plugin list ...) are never deleted, only changed; one
+   * that is missing here comes back.
+   */
+  private isDeletable(path: string): boolean {
+    const rest = path.slice(this.configDir.length + 1);
+    return path.startsWith(`${this.configDir}/`) && rest.includes("/");
+  }
+
+  /** A plugin or theme counts once however many files it has (a snippet is one file). */
+  private unitOf(path: string): string {
+    const parts = path.slice(this.configDir.length + 1).split("/");
+    return parts[0] === "snippets" ? parts.slice(0, 2).join("/") : parts.slice(0, 2).join("/");
+  }
+
+  /**
+   * Sends the deletions made on this device to the server, so the other devices delete those files too. The same safety
+   * rule as for notes: when much more is missing at once than anybody removes by hand (a moved or re-created settings
+   * folder, for example), nothing is deleted and the files are fetched again instead.
+   */
+  private async applyDeletedHere(settings: ConfigSyncSettings, deletedHere: Array<{ path: string; item: DecodedFileListItem | null }>): Promise<void> {
+    if (deletedHere.length === 0) return;
+    const knownPrefix = `${this.deps.vaultId}|`;
+    const trackedUnits = new Set(
+      Object.keys(settings.known)
+        .filter((key) => key.startsWith(knownPrefix))
+        .map((key) => key.slice(knownPrefix.length))
+        .filter((path) => this.isDeletable(path))
+        .map((path) => this.unitOf(path)),
+    );
+    for (const { path } of deletedHere) trackedUnits.add(this.unitOf(path));
+    const missingUnits = new Set(deletedHere.map(({ path }) => this.unitOf(path)));
+    const allowed = missingUnits.size <= 3 || missingUnits.size <= trackedUnits.size / 2;
+
+    if (!allowed) {
+      console.warn(`Syncstone: ${missingUnits.size} von ${trackedUnits.size} Plugins/Themes fehlen hier auf einmal - sie werden wiederhergestellt statt überall gelöscht.`);
+      for (const { path, item } of deletedHere) {
+        if (item && (await this.downloadPath(path, item))) settings.known[this.knownKey(path)] = toBase64(item.contentHashBlinded);
+      }
+      this.fullyListed = false; // files that did not come with this list are fetched by the next, full one
+      return;
+    }
+
+    for (const { path } of deletedHere) {
+      try {
+        await this.deps.remote.deleteFile(this.deps.vaultId, await deterministicFileId(this.deps.vaultId, path));
+      } catch (err) {
+        if ((err as { status?: unknown } | null)?.status !== 404) throw err; // already gone on the server: fine
+      }
+      this.forget(settings, path);
+      this.reconciledMtimes.delete(path);
+      this.deps.log?.add({ kind: "delete-up", path });
+    }
+  }
+
+  /** After a file was removed because another device deleted it: drop folders that are empty now (a whole plugin). */
+  private async pruneEmptyFolders(path: string): Promise<void> {
+    const adapter = this.deps.app.vault.adapter;
+    const stops = new Set([this.configDir, `${this.configDir}/plugins`, `${this.configDir}/themes`, `${this.configDir}/snippets`]);
+    let folder = path.slice(0, path.lastIndexOf("/"));
+    while (folder.startsWith(`${this.configDir}/`) && !stops.has(folder)) {
+      try {
+        const listing = await adapter.list(folder);
+        if (listing.files.length > 0 || listing.folders.length > 0) return;
+        await adapter.rmdir(folder, false);
+      } catch {
+        return;
+      }
+      folder = folder.slice(0, folder.lastIndexOf("/"));
+    }
   }
 
   /**
