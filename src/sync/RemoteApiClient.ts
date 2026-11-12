@@ -86,6 +86,8 @@ export class RemoteApiClient {
   constructor(
     private readonly getServerUrl: () => string,
     private readonly getSessionToken: () => string | null,
+    /** This plugin's version, reported with the online check so the account's device list can show it. */
+    private readonly pluginVersion?: string,
   ) {}
 
   private get serverUrl(): string {
@@ -113,8 +115,10 @@ export class RemoteApiClient {
   }
 
   /** The account with its storage numbers, plan state and limits (drives the storage row and the sync icon warning). */
+  /** Also the device's online check: it tells the server which plugin version this device runs (stored only when it changed). */
   async getMe(): Promise<MeResponse> {
-    return apiRequest<MeResponse>(this.serverUrl, { path: "/auth/me", token: this.token });
+    const headers = this.pluginVersion ? { "X-Syncstone-Client": `plugin/${this.pluginVersion}` } : undefined;
+    return apiRequest<MeResponse>(this.serverUrl, { path: "/auth/me", token: this.token, headers });
   }
 
   /** Plan and subscription of the account - hosted service only (a self-hosted server answers 404). */

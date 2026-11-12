@@ -82,6 +82,7 @@ export default class SyncstonePlugin extends Plugin {
     this.remoteApi = new RemoteApiClient(
       () => this.serverUrl,
       () => this.settings.sessionToken,
+      this.manifest.version,
     );
     this.cryptoService = new CryptoService();
     this.vaultLinkManager = new VaultLinkManager(this.remoteApi, this.cryptoService);
