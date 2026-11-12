@@ -213,7 +213,6 @@ export default class SyncstonePlugin extends Plugin {
     }
     new BackupNoticeModal(
       this.app,
-      linked.vaultName,
       preview,
       () => this.acknowledgeBackup(),
       () => {

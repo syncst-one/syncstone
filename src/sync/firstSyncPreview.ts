@@ -13,8 +13,6 @@ export interface FirstSyncPreview {
   differ: number;
   download: number;
   upload: number;
-  /** Both sides have files but hardly any in common: probably two different vaults. */
-  mismatch: boolean;
 }
 
 export interface FirstSyncPreviewDeps {
@@ -60,8 +58,6 @@ export async function previewFirstSync(deps: FirstSyncPreviewDeps): Promise<Firs
   }
 
   const upload = local.filter((file) => !remotePaths.has(file.path)).length;
-  const shared = same + differ;
-  const smaller = Math.min(remotePaths.size, local.length);
   return {
     remote: remotePaths.size,
     local: local.length,
@@ -69,6 +65,5 @@ export async function previewFirstSync(deps: FirstSyncPreviewDeps): Promise<Firs
     differ,
     download,
     upload,
-    mismatch: smaller > 0 && shared < smaller / 2,
   };
 }
