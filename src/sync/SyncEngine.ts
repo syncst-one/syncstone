@@ -1148,6 +1148,9 @@ export class SyncEngine {
     // The place is taken by another file.
     if (mayDefer) return null;
     if (haveLocalCopy && from !== null) {
+      // Only the upper/lower case differs: the server's spelling stays (all other devices use it); this device keeps
+      // its spelling for now and takes the server's with the next sync, instead of the two renaming each other back.
+      if (from.toLowerCase() === serverPath.toLowerCase()) return from;
       console.warn(`Syncstone: "${serverPath}" ist hier schon belegt - "${from}" behält seinen Namen.`);
       await this.renameRemote(item.id, from);
       return from;
@@ -1203,6 +1206,22 @@ export class SyncEngine {
 
   /** Moves a file because another device renamed it; the vault's rename event for it is recognised as ours. */
   private async moveLocal(oldPath: string, newPath: string): Promise<boolean> {
+    if (await this.renameOwn(oldPath, newPath).catch(() => false)) return true;
+    if (oldPath === newPath || oldPath.toLowerCase() !== newPath.toLowerCase()) return false;
+    // Only the upper/lower case changes, and that was refused (some systems take the new name for the old file): done
+    // in two steps, through a short-lived name of its own.
+    const dot = newPath.lastIndexOf(".");
+    const slash = newPath.lastIndexOf("/");
+    const ext = dot > slash + 1 ? newPath.slice(dot) : "";
+    const temp = `${newPath.slice(0, newPath.length - ext.length)} (renaming ${crypto.randomUUID().slice(0, 6)})${ext}`;
+    if (!(await this.renameOwn(oldPath, temp).catch(() => false))) return false;
+    if (await this.renameOwn(temp, newPath).catch(() => false)) return true;
+    await this.renameOwn(temp, oldPath).catch(() => false); // put back
+    return false;
+  }
+
+  /** One rename this engine makes itself; the vault's rename event for it is recognised as ours (see `ownRenames`). */
+  private async renameOwn(oldPath: string, newPath: string): Promise<boolean> {
     this.ownRenames.set(newPath, oldPath);
     try {
       return await this.deps.fs.renamePath(oldPath, newPath);
