@@ -3,7 +3,7 @@ import { t } from "../i18n/index.js";
 import { App, Notice, Platform, PluginSettingTab, Setting, setIcon, type TextComponent } from "obsidian";
 import { defaultDeviceName } from "../deviceName.js";
 import type SyncstonePlugin from "../main.js";
-import type { LinkedVaultConfig } from "../types.js";
+import { localIndexNameFor, type LinkedVaultConfig } from "../types.js";
 import { VaultLinkError, type VaultLinkResult } from "../sync/VaultLinkManager.js";
 import { SyncstoneApiError } from "../sync/httpClient.js";
 import { formatBytes } from "../ui/historyFormat.js";
@@ -775,7 +775,10 @@ export class SyncstoneSettingsTab extends PluginSettingTab {
   }
 
   private async applyVaultLink(result: VaultLinkResult, remember: boolean): Promise<void> {
-    this.plugin.settings.linkedVault = result.config;
+    this.plugin.settings.linkedVault = {
+      ...result.config,
+      localIndexName: localIndexNameFor(result.config.vaultId, (this.app as unknown as { appId?: string }).appId),
+    };
     this.plugin.settings.backupAcknowledged = false; // a newly linked vault gets the first-sync check before anything moves
     this.plugin.settings.rememberKey = remember;
     this.plugin.settings.cachedKeyMaterial = remember && result.rootBitsBase64 ? { rootBitsBase64: result.rootBitsBase64 } : null;

@@ -8,6 +8,12 @@ import DiffMatchPatch from "diff-match-patch";
  * combined without guessing; the caller then keeps both versions (e.g. as a conflict copy).
  */
 export function merge3(base: string, local: string, remote: string): string | null {
+  // Line endings are not content: a file saved by a Windows program (CRLF) must not make every line look changed.
+  if (base.includes("\r") || local.includes("\r") || remote.includes("\r")) {
+    const lf = (text: string) => text.replace(/\r\n/g, "\n");
+    const merged = merge3(lf(base), lf(local), lf(remote));
+    return merged !== null && local.includes("\r\n") ? merged.replace(/\n/g, "\r\n") : merged;
+  }
   if (local === remote) return local;
   if (local === base) return remote;
   if (remote === base) return local;
@@ -49,6 +55,21 @@ function resolveRegion(base: string[], local: string[], remote: string[]): strin
   if (same(local, remote)) return local;
   if (same(local, base)) return remote;
   if (same(remote, base)) return local;
+  // Same number of lines on all three sides (ticked tasks, edited lines): decided line by line, so edits of
+  // neighbouring lines - or the very same edit on both sides - combine instead of counting as a conflict.
+  if (local.length === base.length && remote.length === base.length) {
+    const lines: string[] = [];
+    for (let k = 0; k < base.length; k++) {
+      if (local[k] === remote[k] || remote[k] === base[k]) lines.push(local[k]);
+      else if (local[k] === base[k]) lines.push(remote[k]);
+      else {
+        const word = mergeWords(base[k], local[k], remote[k]);
+        if (word === null) return null;
+        lines.push(word);
+      }
+    }
+    return lines;
+  }
   const refined = mergeWords(base.join("\n"), local.join("\n"), remote.join("\n"));
   return refined === null ? null : refined.split("\n");
 }

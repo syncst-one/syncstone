@@ -135,6 +135,7 @@ export const it: Partial<Record<MessageKey, string>> = {
   "p.fail.tooBigServer": "Più grande di quanto consente il tuo account ({limit})",
   "p.fail.quota": "Lo spazio è pieno",
   "p.fail.error": "Non sincronizzato: {error}",
+  "p.fail.changedMeanwhile": "Il file è stato modificato su un altro dispositivo durante la sincronizzazione. Verrà confrontato di nuovo alla prossima sincronizzazione.",
   "p.fail.ring": "Non sincronizzato: {reason}",
   "p.fail.folder_one": "{count} file non è stato sincronizzato",
   "p.fail.folder_other": "{count} file non sono stati sincronizzati",

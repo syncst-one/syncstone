@@ -31,6 +31,23 @@ export interface DecodedFileListItem {
   updatedAt: string;
 }
 
+/** The server's answer to a write based on outdated content (409 `stale_base`): what it has now. */
+export function staleBaseItem(err: unknown): DecodedFileListItem | null {
+  const body = (err as { status?: unknown; body?: unknown } | null)?.status === 409 ? (err as { body?: unknown }).body : null;
+  const current = (body as { code?: unknown; current?: FileListItem } | null)?.code === "stale_base" ? (body as { current: FileListItem }).current : null;
+  if (!current) return null;
+  return {
+    id: current.id,
+    pathCiphertext: fromBase64(current.pathCiphertext),
+    pathNonce: fromBase64(current.pathNonce),
+    contentHashBlinded: fromBase64(current.contentHashBlinded),
+    contentSize: current.contentSize,
+    version: current.version,
+    isDeleted: current.isDeleted,
+    updatedAt: current.updatedAt,
+  };
+}
+
 export interface DecodedFileListResponse {
   files: DecodedFileListItem[];
   currentVersion: number;
@@ -51,6 +68,8 @@ export interface UploadFilePayload {
   contentCiphertext: Uint8Array;
   /** See `UploadFileMetaSchema.editSessionId` - folds a burst of saves into one history entry. */
   editSessionId?: string;
+  /** See `UploadFileMetaSchema.baseHash`: the content (blinded hash, base64) this write changes, null for a new file. */
+  baseHash?: string | null;
 }
 
 /** Bytes done / total of one transfer (the encrypted blob, so a bit larger than the file). */
@@ -191,6 +210,7 @@ export class RemoteApiClient {
       contentHashBlinded: toBase64(payload.contentHashBlinded),
       contentSize: payload.contentSize,
       editSessionId: payload.editSessionId,
+      baseHash: payload.baseHash,
     };
 
     const total = payload.contentIv.length + payload.contentCiphertext.length;

@@ -135,6 +135,7 @@ export const nl: Partial<Record<MessageKey, string>> = {
   "p.fail.tooBigServer": "Groter dan je account toestaat ({limit})",
   "p.fail.quota": "Opslag is vol",
   "p.fail.error": "Niet gesynchroniseerd: {error}",
+  "p.fail.changedMeanwhile": "Het bestand is tijdens de synchronisatie op een ander apparaat gewijzigd. Het wordt bij de volgende synchronisatie opnieuw vergeleken.",
   "p.fail.ring": "Niet gesynchroniseerd: {reason}",
   "p.fail.folder_one": "{count} bestand kon niet worden gesynchroniseerd",
   "p.fail.folder_other": "{count} bestanden konden niet worden gesynchroniseerd",

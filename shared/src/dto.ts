@@ -433,8 +433,23 @@ export const UploadFileMetaSchema = z.object({
    * Consecutive "modify" writes with the same id are folded into one history entry instead of one per debounced save.
    */
   editSessionId: z.string().uuid().optional(),
+  /**
+   * The content this write is based on: the blinded hash the client last had in common with the server for this file,
+   * or null for a file the client believes is new. When the server's current content is a different one (another
+   * device wrote in between), the write is refused with 409 `stale_base` and the current state, so the client merges
+   * instead of silently overwriting. Absent (older clients): no check. A deleted file may always be written again.
+   */
+  baseHash: z.string().nullable().optional(),
 });
 export type UploadFileMeta = z.infer<typeof UploadFileMetaSchema>;
+
+/** Body of a 409 answer to an upload whose `baseHash` is no longer the server's content. */
+export const StaleBaseResponseSchema = z.object({
+  error: z.string(),
+  code: z.literal("stale_base"),
+  current: FileListItemSchema,
+});
+export type StaleBaseResponse = z.infer<typeof StaleBaseResponseSchema>;
 
 export const RenameFileRequestSchema = z.object({
   newPathCiphertext: z.string(),

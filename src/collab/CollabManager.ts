@@ -42,6 +42,11 @@ export interface CollabManagerDeps {
   /** The note's current content on the server (decrypted), or null if it cannot be loaded right now. */
   loadServerText: (fileId: string) => Promise<string | null>;
   log?: SyncLog;
+  /**
+   * A live session of `file` ended here. While it ran, only the host wrote the note; this device now writes it again
+   * itself and compares its text with the server once (nothing is sent when the host already did).
+   */
+  onLiveEnded?: (file: TFile) => void;
   /** Called whenever who-is-in-which-note may have changed, so the UI (header avatars) can re-read `presenceFor`. */
   onPresenceChange: () => void;
 }
@@ -135,6 +140,16 @@ export class CollabManager {
     return this.rooms.get(fileId)?.session != null;
   }
 
+  /**
+   * Read by SyncEngine: whether this device writes `fileId` to the server. While a note is co-edited, only the session's
+   * host does (everybody has the same text, so one write is enough, and two devices never race each other with it).
+   */
+  isWriter(fileId: string): boolean {
+    const room = this.rooms.get(fileId);
+    if (!room?.session) return true;
+    return room.synced && this.isHost(room);
+  }
+
   /** The other devices co-editing `path` right now (null if that note isn't being co-edited). */
   presenceFor(path: string): CollabPresence[] | null {
     for (const room of this.rooms.values()) {
@@ -177,6 +192,29 @@ export class CollabManager {
     if (this.disposed) return false;
     return new Promise<boolean>((resolve) => {
       this.enqueue(() => resolve(this.putIntoSession(fileId, text)));
+      // Runs even if the task above threw or was skipped (manager disposed): then nothing was applied.
+      this.queue = this.queue.then(() => resolve(false));
+    });
+  }
+
+  /**
+   * Merges `remote` (another device's version, changed from `base`) into the live session of `fileId` through this
+   * device's editor, in one step against what the editor shows right now (so nothing being typed is lost). Returns the
+   * new text, null when the edits overlap (nothing changed then), false when the note is not live here.
+   */
+  async mergeIntoLive(fileId: string, base: string, remote: string): Promise<string | null | false> {
+    if (this.disposed) return false;
+    return new Promise<string | null | false>((resolve) => {
+      this.enqueue(() => {
+        const room = this.rooms.get(fileId);
+        const cm = room?.boundEditor;
+        if (!room || !room.session || !room.synced || !cm || !this.showsRoomFile(room)) return resolve(false);
+        const merged = merge3(base, cm.state.doc.toString(), remote);
+        if (merged === null) return resolve(null);
+        if (merged.length > COLLAB_MAX_TEXT_LENGTH) return resolve(false);
+        replaceEditorText(cm, merged);
+        resolve(merged);
+      });
       // Runs even if the task above threw or was skipped (manager disposed): then nothing was applied.
       this.queue = this.queue.then(() => resolve(false));
     });
@@ -332,7 +370,7 @@ export class CollabManager {
   // Server messages
   // ============================================================
 
-  private onPeers(message: CollabPeersMessage): void {
+  private async onPeers(message: CollabPeersMessage): Promise<void> {
     const room = this.rooms.get(message.fileId);
     if (!room) return; // stale: we already closed that note
 
@@ -345,7 +383,7 @@ export class CollabManager {
       // Alone in the note again - back to plain file sync.
       this.stopSession(room);
     } else if (!room.session) {
-      this.startSession(room, false);
+      await this.startSession(room, false);
     } else {
       const me = message.peers.find((peer) => peer.peerId === message.you);
       if (me) room.session.setUserName(me.deviceName);
@@ -399,7 +437,7 @@ export class CollabManager {
 
     switch (opened.kind) {
       case CollabKind.StateRequest:
-        this.answerStateRequest(room, message.from, opened.payload);
+        await this.answerStateRequest(room, message.from, opened.payload);
         break;
       case CollabKind.StateReply:
         await this.applyStateReply(room, opened.payload);
@@ -423,7 +461,7 @@ export class CollabManager {
    * (`forceHost`: we were asked for state before we knew we should start);
    * everybody else is a joiner and fetches the host's state first.
    */
-  private startSession(room: Room, forceHost: boolean): void {
+  private async startSession(room: Room, forceHost: boolean): Promise<void> {
     const cm = getEditorView(room.view);
     if (!cm || !canBind(cm) || !this.showsRoomFile(room)) return;
     const text = cm.state.doc.toString();
@@ -442,12 +480,42 @@ export class CollabManager {
     room.stateRequestAttempts = 0;
 
     if (forceHost || lowestSeq.peerId === room.you) {
-      session.seed(text);
-      this.bind(room, cm);
+      // The host's text becomes everybody's. This editor may be behind (a phone that was in the background has not
+      // fetched the latest edits yet), so the session starts from the server's current version, with what was typed here
+      // and not sent yet merged on top. Without the server's version there is no live session; plain sync carries on.
+      const seed = await this.hostSeed(room, text);
+      const latestCm = getEditorView(room.view);
+      if (seed === null || room.session !== session || this.rooms.get(room.fileId) !== room || !latestCm || !this.showsRoomFile(room)) {
+        if (room.session === session) {
+          session.destroy();
+          room.session = null;
+        }
+        return;
+      }
+      replaceEditorText(latestCm, seed);
+      session.seed(seed);
+      this.bind(room, latestCm);
       room.synced = true;
     } else {
       this.requestState(room);
     }
+  }
+
+  /**
+   * What the host starts a live session with: the server's current text, plus this device's edits that were not sent
+   * yet (merged on top of it). Null when the server's version cannot be loaded right now.
+   */
+  private async hostSeed(room: Room, editorText: string): Promise<string | null> {
+    const server = await this.deps.loadServerText(room.fileId);
+    if (server === null) return null;
+    if (server === editorText) return editorText;
+    // Nothing typed here since the last sync: this editor is only behind, the server's text is the current one.
+    if (await this.deps.isTextSynced(room.path, editorText)) return server;
+    const base = await this.deps.mergeBase(room.path);
+    const merged = base === null ? null : merge3(base, editorText, server);
+    // Edits here that overlap with other changes: the session keeps this device's text, and the next write is refused by
+    // the server as outdated, which merges it with the server's version or keeps that one as a copy.
+    return merged ?? editorText;
   }
 
   private stopSession(room: Room): void {
@@ -456,7 +524,10 @@ export class CollabManager {
     this.unbind(room);
     room.session?.destroy();
     room.session = null;
-    if (room.synced) this.deps.log?.add({ kind: "live-leave", path: room.path });
+    if (room.synced) {
+      this.deps.log?.add({ kind: "live-leave", path: room.path });
+      if (!this.disposed) this.deps.onLiveEnded?.(room.file);
+    }
     room.synced = false;
   }
 
@@ -486,10 +557,10 @@ export class CollabManager {
   }
 
   /** Host: send a joiner everything it is missing. */
-  private answerStateRequest(room: Room, from: string, stateVector: Uint8Array): void {
+  private async answerStateRequest(room: Room, from: string, stateVector: Uint8Array): Promise<void> {
     if (!room.session) {
       if (room.peers.length < 2) return;
-      this.startSession(room, true);
+      await this.startSession(room, true);
     }
     const session = room.session;
     if (!session || !room.synced) return; // we are still waiting for state ourselves

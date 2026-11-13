@@ -1,7 +1,7 @@
 import { MarkdownView, normalizePath, Notice, Plugin, TFile } from "obsidian";
 import { applyHistoryTexts, t } from "./i18n";
 import { REMOTE_POLL_INTERVAL_MS, toBase64, unpackBlob, type HealthResponse, type MeResponse } from "@websync/shared";
-import { DEFAULT_SETTINGS, type SyncstoneSettings } from "./types.js";
+import { DEFAULT_SETTINGS, localIndexNameFor, type SyncstoneSettings } from "./types.js";
 import { HOSTED_SERVER_URL, normalizeServerUrl } from "./hosted.js";
 import { AuthClient } from "./sync/AuthClient.js";
 import { RemoteApiClient } from "./sync/RemoteApiClient.js";
@@ -436,7 +436,13 @@ export default class SyncstonePlugin extends Plugin {
     }
 
     const linkedVault = this.settings.linkedVault;
-    const localIndex = new LocalIndex(linkedVault.vaultId);
+    // A vault folder copied on this computer brings the copied settings along: it gets an index of its own.
+    const appId = (this.app as unknown as { appId?: string }).appId;
+    if (linkedVault.localIndexName && appId && !linkedVault.localIndexName.endsWith(appId)) {
+      linkedVault.localIndexName = localIndexNameFor(linkedVault.vaultId, appId);
+      await this.saveSettings();
+    }
+    const localIndex = new LocalIndex(linkedVault.vaultId, linkedVault.localIndexName);
     await localIndex.open();
     this.localIndex = localIndex;
 
@@ -450,6 +456,8 @@ export default class SyncstonePlugin extends Plugin {
       mobileMaxFileBytes: () => (this.settings.mobileMaxFileMb > 0 ? this.settings.mobileMaxFileMb * 1024 * 1024 : Number.POSITIVE_INFINITY),
       isConfigPath: (path) => this.isConfigPath(path),
       isCollabLive: (fileId) => this.collabManager?.isLive(fileId) ?? false,
+      isCollabWriter: (fileId) => this.collabManager?.isWriter(fileId) ?? true,
+      mergeIntoLive: async (fileId, base, remote) => (this.collabManager ? await this.collabManager.mergeIntoLive(fileId, base, remote) : false),
       transfers: this.transfers,
       log: this.syncLog,
       initialGlobalVersion: linkedVault.lastSyncedGlobalVersion,
@@ -591,6 +599,7 @@ export default class SyncstonePlugin extends Plugin {
           }
         },
         onPresenceChange: () => this.headerActions?.refresh(),
+        onLiveEnded: (file) => this.syncEngine?.handleLocalEvent("modify", file),
       });
       this.collabManager = collabManager;
 

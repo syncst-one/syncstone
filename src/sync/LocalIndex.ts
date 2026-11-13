@@ -44,10 +44,14 @@ export interface SyncBase {
 export class LocalIndex {
   private db: IDBDatabase | null = null;
 
-  constructor(private readonly vaultId: string) {}
+  /** `name`: the IndexedDB database to use (see `LinkedVaultConfig.localIndexName`); by default the one per server vault. */
+  constructor(
+    private readonly vaultId: string,
+    private readonly name?: string,
+  ) {}
 
   private get dbName(): string {
-    return `websync-index-${this.vaultId}`;
+    return this.name ?? `websync-index-${this.vaultId}`;
   }
 
   async open(): Promise<void> {

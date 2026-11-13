@@ -30,6 +30,13 @@ export interface LinkedVaultConfig {
    * individual file's `version` field.
    */
   lastSyncedGlobalVersion: number;
+  /**
+   * The local index's database for this link. IndexedDB is shared by every vault opened in the same Obsidian app, so
+   * two local vaults linked to the same server vault on one computer would otherwise share one index and mix up which
+   * file is where. Set for links made since this existed (named after this local vault); older links keep the shared
+   * name they always had.
+   */
+  localIndexName?: string;
 }
 
 export interface CachedKeyMaterial {
@@ -159,3 +166,8 @@ export const DEFAULT_SETTINGS: SyncstoneSettings = {
     lastSyncedGlobalVersion: 0,
   },
 };
+
+/** The local index database of a link made in the local vault `appId` (see `LinkedVaultConfig.localIndexName`). */
+export function localIndexNameFor(vaultId: string, appId: string | undefined): string {
+  return `websync-index-${vaultId}-${appId ?? crypto.randomUUID().slice(0, 8)}`;
+}

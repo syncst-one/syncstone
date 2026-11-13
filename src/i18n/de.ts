@@ -135,6 +135,7 @@ export const de: Partial<Record<MessageKey, string>> = {
   "p.fail.tooBigServer": "Größer als dein Konto erlaubt ({limit})",
   "p.fail.quota": "Speicher ist voll",
   "p.fail.error": "Nicht synchronisiert: {error}",
+  "p.fail.changedMeanwhile": "Die Datei wurde während des Syncs auf einem anderen Gerät geändert. Sie wird beim nächsten Sync abgeglichen.",
   "p.fail.ring": "Nicht synchronisiert: {reason}",
   "p.fail.folder_one": "{count} Datei konnte nicht synchronisiert werden",
   "p.fail.folder_other": "{count} Dateien konnten nicht synchronisiert werden",

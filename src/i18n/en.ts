@@ -134,6 +134,7 @@ export const en = {
   "p.fail.tooBigServer": "Larger than your account allows ({limit})",
   "p.fail.quota": "Storage is full",
   "p.fail.error": "Not synced: {error}",
+  "p.fail.changedMeanwhile": "The file was changed on another device during the sync. It is compared again with the next sync.",
   "p.fail.ring": "Not synced: {reason}",
   "p.fail.folder_one": "{count} file could not be synced",
   "p.fail.folder_other": "{count} files could not be synced",

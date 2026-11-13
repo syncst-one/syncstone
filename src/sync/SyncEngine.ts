@@ -9,7 +9,7 @@ import {
   unpackBlob,
 } from "@websync/shared";
 import type { CryptoService } from "./CryptoService.js";
-import type { DecodedFileListItem, RemoteApiClient } from "./RemoteApiClient.js";
+import { staleBaseItem, type DecodedFileListItem, type RemoteApiClient } from "./RemoteApiClient.js";
 import type { LocalIndex, LocalIndexRecord } from "./LocalIndex.js";
 import type { FileSystemAdapter } from "./FileSystemAdapter.js";
 import type { TransferTracker } from "../ui/TransferTracker.js";
@@ -29,6 +29,8 @@ const FAILURE_BACKOFF_MS = 5 * 60 * 1000;
 const MAX_FILE_ATTEMPTS = 3;
 /** An edit is only sent after a sync of the server's changes that is at most this old (see `catchUp`). */
 const CATCH_UP_FRESH_MS = 15_000;
+/** The same for a file that is new here: a note of the same name may have been created elsewhere a moment ago. */
+const CATCH_UP_NEW_FILE_MS = 1_000;
 
 /** Errors that say "nothing will work right now" (offline, signed out, server down) - those still stop the whole run. */
 function isFatal(err: unknown): boolean {
@@ -61,6 +63,19 @@ export interface SyncEngineDeps {
    * renames/deletes are unaffected. Optional so the engine works without collab.
    */
   isCollabLive?: (fileId: string) => boolean;
+  /**
+   * While a note is co-edited live, exactly one device (the session's host) writes it to the server; the others get the
+   * same text through the session and stay quiet, so two devices never race each other with the same edits. True when
+   * the note is not live here, or this device is its host. Optional so the engine works without collab.
+   */
+  isCollabWriter?: (fileId: string) => boolean;
+  /**
+   * Merges another device's version (`remote`, changed from `base`) into the live session of `fileId`, right in this
+   * device's editor (the host's), so every device in the note gets it at once - with what is being typed this very
+   * moment kept. Used when a device that is not in the session changed the note. Returns the session's new text, null
+   * when the two overlap (nothing changed), false when the note is not live here right now.
+   */
+  mergeIntoLive?: (fileId: string, base: string, remote: string) => Promise<string | null | false>;
   /** Receives the progress of uploads/downloads (explorer rings). Optional so the engine works without UI. */
   transfers?: TransferTracker;
   /** The sync log dialog's record of what happened. */
@@ -146,6 +161,16 @@ export class SyncEngine {
   private mobileLimit(): number {
     return this.deps.mobileMaxFileBytes?.() ?? MOBILE_MAX_SYNC_FILE_SIZE_BYTES;
   }
+
+  /**
+   * Renames made here whose debounce has not run yet: new path -> the path the server still has. An edit that arrives
+   * under the new name before the rename was sent (typing right after renaming, or live edits from another device) must
+   * not replace the rename: it would be uploaded as a new file and the note would exist twice. The rename always goes
+   * first, then the edit.
+   */
+  private readonly pendingRenames = new Map<string, string>();
+  /** Files whose write was refused as outdated and are being merged right now (guards against going round in circles). */
+  private readonly resolvingStale = new Set<string>();
 
   /** Files and folders the user deleted here, with the time: a transfer that was running meanwhile must not undo that. */
   private readonly locallyDeleted = new Map<string, number>();
@@ -327,7 +352,36 @@ export class SyncEngine {
       this.deps.transfers?.release(path); // deleted before it was sent: nothing to wait for
       this.deps.transfers?.clearFailure(path);
     } else this.deps.transfers?.queue([path], Date.now(), true);
-    this.scheduleDebounced(path, () => this.processLocalChange(type, path), path);
+    this.scheduleDebounced(path, () => this.afterPendingRename(path, () => this.processLocalChange(type, path)), path);
+  }
+
+  /**
+   * Sends every rename made here that is still waiting for its debounce. Runs before another device's changes are
+   * applied: until the server knows the new name, this device's index still has the old one, and an edit of the note
+   * made elsewhere meanwhile would be written to the old name as a second file.
+   */
+  private async sendPendingRenames(): Promise<void> {
+    for (const [newPath, from] of [...this.pendingRenames]) {
+      if (this.pendingRenames.get(newPath) !== from) continue;
+      this.pendingRenames.delete(newPath);
+      if (from === newPath) continue;
+      try {
+        await this.processLocalRename(from, newPath);
+      } catch (err) {
+        this.pendingRenames.set(newPath, from); // tried again with the next sync or the debounce
+        throw err;
+      }
+    }
+  }
+
+  /** Sends a rename of `path` that is still waiting first (see `pendingRenames`), then runs `action`. */
+  private async afterPendingRename(path: string, action: () => Promise<void>): Promise<void> {
+    const from = this.pendingRenames.get(path);
+    if (from !== undefined) {
+      this.pendingRenames.delete(path);
+      if (from !== path) await this.processLocalRename(from, path);
+    }
+    await action();
   }
 
   handleLocalRename(file: TAbstractFile, oldPath: string): void {
@@ -352,8 +406,13 @@ export class SyncEngine {
       }
       return;
     }
+    // Renamed again before the first rename was sent: the server still has the first name.
+    const serverPath = this.pendingRenames.get(oldPath) ?? oldPath;
+    this.pendingRenames.delete(oldPath);
     this.clearDebounce(oldPath);
-    this.scheduleDebounced(newPath, () => this.processLocalRename(oldPath, newPath));
+    this.pendingRenames.set(newPath, serverPath);
+    // An edit that was waiting under the old name goes along: after the rename the content is compared and sent if new.
+    this.scheduleDebounced(newPath, () => this.afterPendingRename(newPath, () => this.processLocalChange("modify", newPath)), newPath);
   }
 
   /**
@@ -364,7 +423,7 @@ export class SyncEngine {
     if (!this.debounceTimers.has(path)) return;
     this.clearDebounce(path);
     try {
-      await this.processLocalChange("modify", path);
+      await this.afterPendingRename(path, () => this.processLocalChange("modify", path));
     } finally {
       this.deps.transfers?.release(path);
     }
@@ -437,7 +496,11 @@ export class SyncEngine {
 
     // An upload carries the file's path. If another device moved or renamed the note while this one was away (or busy), sending the
     // edit now would put it back at its old place: first take over what the server has changed.
-    if (type !== "create" && (await this.deps.localIndex.getByPath(path))) await this.catchUp();
+    // A new note too: another device may have created one with the same name a moment ago (a daily note made on two
+    // devices). Catching up first (even shortly after the last sync) finds it, so both are compared and combined
+    // instead of becoming two files.
+    const known = type !== "create" && (await this.deps.localIndex.getByPath(path));
+    await this.catchUp(known ? CATCH_UP_FRESH_MS : CATCH_UP_NEW_FILE_MS);
 
     const file = this.deps.fs.getFileByPath(path);
     if (!file) return; // vanished again before the debounce fired (or moved by the sync that just ran - it sends the edit from its new place)
@@ -446,11 +509,12 @@ export class SyncEngine {
     const fileId = record?.fileId ?? crypto.randomUUID();
 
     await this.withFileLock(fileId, async () => {
+      if (record && !(this.deps.isCollabWriter?.(fileId) ?? true)) return; // co-edited live: the session's host writes it
       const plaintext = await this.readLocal(file);
       if (!plaintext) return; // deleted meanwhile
       const hash = await this.deps.crypto.hashContent(plaintext);
       if (record && record.lastContentHashBlinded === toBase64(hash)) return; // no real content change (e.g. mtime-only touch)
-      await this.uploadFile(file, fileId, { plaintext, hash }, record ? "local" : "new");
+      await this.uploadFile(file, fileId, { plaintext, hash }, record ? "local" : "new", record ? record.lastContentHashBlinded : null);
     });
   }
 
@@ -459,8 +523,8 @@ export class SyncEngine {
    * moves from other devices are applied first, so an edit made at the old path cannot undo them. A sync that is already
    * running does the same job, so it is waited for instead.
    */
-  private async catchUp(): Promise<void> {
-    if (Date.now() - this.lastSyncedAt < CATCH_UP_FRESH_MS) return;
+  private async catchUp(freshMs = CATCH_UP_FRESH_MS): Promise<void> {
+    if (Date.now() - this.lastSyncedAt < freshMs) return;
     for (let waited = 0; this.syncing && waited < 10_000; waited += 100) {
       await new Promise((resolve) => window.setTimeout(resolve, 100));
     }
@@ -573,6 +637,7 @@ export class SyncEngine {
   // ============================================================
 
   private async doFullSync(): Promise<void> {
+    await this.sendPendingRenames();
     const localFiles = this.deps.fs.listAllFiles();
     const localByPath = new Map(localFiles.map((f) => [f.path, f] as const));
 
@@ -592,7 +657,9 @@ export class SyncEngine {
     // it looks like a broken or moved vault rather than a user action; then the files are restored instead.
     const tracked = indexRecords.filter((r) => !isMarkerPath(r.localPath) && !this.deps.isConfigPath(r.localPath));
     const missing = tracked.filter((r) => !localByPath.has(r.localPath)).length;
-    const allowLocalDeletes = missing <= 10 || missing <= tracked.length / 2;
+    // Deleting by hand while the app is closed is a handful of files; a large share missing at once is a moved, damaged or
+    // re-created folder: then the files come back instead of being deleted on every device.
+    const allowLocalDeletes = missing <= 5 || missing <= tracked.length / 10;
     if (!allowLocalDeletes) {
       console.warn(`Syncstone: ${missing} von ${tracked.length} Dateien fehlen lokal - werden wieder heruntergeladen.`);
       new Notice(t("p.sync.missingLocal", { count: missing }));
@@ -676,7 +743,7 @@ export class SyncEngine {
       if (this.disposed) return;
       if (handledPaths.has(path)) continue;
       const fileId = crypto.randomUUID();
-      await this.attempt(`path:${path}`, path, () => this.withFileLock(fileId, () => this.uploadFile(file, fileId, undefined, "new")));
+      await this.attempt(`path:${path}`, path, () => this.withFileLock(fileId, () => this.uploadFile(file, fileId, undefined, "new", null)));
       handledPaths.add(path);
     }
 
@@ -741,7 +808,7 @@ export class SyncEngine {
 
     if (!remoteItem) {
       // Server has no memory of this fileId at all (e.g. vault reset server-side).
-      if (localFile) await this.uploadFile(localFile, record.fileId, undefined, "new");
+      if (localFile) await this.uploadFile(localFile, record.fileId, undefined, "new", null);
       else await this.deps.localIndex.delete(record.fileId);
       return;
     }
@@ -752,10 +819,10 @@ export class SyncEngine {
       } else if (!localFile) {
         await this.deps.localIndex.delete(record.fileId);
         await this.deps.fs.pruneEmptyParents(record.localPath); // the file is gone already, but its folder may be left empty
-      } else if (await this.remoteDeleteWins(record, localFile, remoteItem.updatedAt)) {
+      } else if (await this.remoteDeleteWins(record, localFile)) {
         await this.applyRemoteDelete(record.fileId, record.localPath);
       } else {
-        await this.uploadFile(localFile, record.fileId, undefined, "restored"); // local edit after remote delete wins (LWW) - resurrects it server-side
+        await this.uploadFile(localFile, record.fileId, undefined, "restored", record.lastContentHashBlinded); // edited here after the last sync: the edit beats the delete
       }
       this.bumpGlobalVersion(remoteItem.version);
       return;
@@ -817,6 +884,7 @@ export class SyncEngine {
   // ============================================================
 
   private async doIncrementalPoll(): Promise<void> {
+    await this.sendPendingRenames();
     const since = this.currentGlobalVersion;
     const remoteResp = await this.deps.remote.listFiles(this.deps.vaultId, since, true);
     // Oldest first, and the cursor follows item by item: if one of them throws, everything after it is still ahead of
@@ -894,10 +962,10 @@ export class SyncEngine {
         } else if (!localFile) {
           await this.deps.localIndex.delete(item.id);
           await this.deps.fs.pruneEmptyParents(record.localPath); // the file is gone already, but its folder may be left empty
-        } else if (await this.remoteDeleteWins(record, localFile, item.updatedAt)) {
+        } else if (await this.remoteDeleteWins(record, localFile)) {
           await this.applyRemoteDelete(item.id, record.localPath);
         } else {
-          await this.uploadFile(localFile, item.id, undefined, "restored"); // local edit after remote delete wins (LWW)
+          await this.uploadFile(localFile, item.id, undefined, "restored", record.lastContentHashBlinded); // edited here after the last sync: the edit beats the delete
         }
       }
       this.bumpGlobalVersion(item.version);
@@ -1132,6 +1200,10 @@ export class SyncEngine {
 
     const bothChanged = lastHash !== remoteHashBase64 && lastHash !== localHashBase64;
     const live = this.deps.isCollabLive?.(item.id) ?? false;
+    if (live) {
+      await this.reconcileLive(item, path, localBytes, lastHash);
+      return;
+    }
     let copied = false;
     if (bothChanged && !live && isMergeablePath(path)) {
       const outcome = await this.tryMerge(item, path, localFile, localBytes, lastHash, remoteWins);
@@ -1148,8 +1220,59 @@ export class SyncEngine {
       if (bothChanged && !copied && willDownload) await this.saveConflictCopy(path, localBytes);
       await this.downloadFile(item, path, bothChanged ? "newer" : "remote");
     } else {
-      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: localHash }, bothChanged ? "newer" : "local");
+      // Both sides changed and the server's version loses: it is kept next to the note as a copy (for notes that could
+      // not be merged this happened above already), so the other device's work does not just disappear from the vault.
+      if (bothChanged && !copied && !(Platform.isMobile && item.contentSize > this.mobileLimit())) {
+        await this.saveConflictCopy(path, await this.fetchRemotePlaintext(item));
+      }
+      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: localHash }, bothChanged ? "newer" : "local", remoteHashBase64);
     }
+  }
+
+  /**
+   * A note that is co-edited live here, and the server has other content than this device. The editors in the session
+   * all show the same text, and only the host writes it (see `isCollabWriter`). If the server's content is what was
+   * synced last, only the session changed it: the host sends the session's text. Otherwise a device outside the session
+   * changed the note: the host merges that edit into the session (or, if the two overlap, keeps the server's version as
+   * a copy) instead of overwriting it, and from then on writes on top of the server's version.
+   */
+  private async reconcileLive(item: DecodedFileListItem, path: string, localBytes: Uint8Array, lastHash: string | undefined): Promise<void> {
+    if (!(this.deps.isCollabWriter?.(item.id) ?? true)) return; // the host takes care of it
+    const remoteHash = toBase64(item.contentHashBlinded);
+    const file = this.deps.fs.getFileByPath(path);
+    if (!file) return;
+    if (lastHash === remoteHash) {
+      // Only the session changed it: send what is saved (the editor saves newer typing a moment later, sent the same way).
+      await this.uploadFile(file, item.id, { plaintext: localBytes, hash: await this.deps.crypto.hashContent(localBytes) }, "local", remoteHash);
+      return;
+    }
+    if (!this.deps.mergeIntoLive) return;
+    const remoteBytes = await this.fetchRemotePlaintext(item);
+    const remoteText = decodeText(remoteBytes);
+    if (remoteText === null) return;
+    // Merged against the editor's text, not the file: the file lags behind what is being typed right now.
+    const base = lastHash ? await this.deps.localIndex.getBase(item.id).catch(() => undefined) : undefined;
+    const outcome = base && base.hash === lastHash ? await this.deps.mergeIntoLive(item.id, base.text, remoteText) : null;
+    if (outcome === false) {
+      // The session ended a moment ago: compared like any other file. Still live but the editor is not ready: tried again.
+      if (this.deps.isCollabLive?.(item.id)) throw new Error(t("p.fail.changedMeanwhile"));
+      await this.reconcileExisting(item, path, file);
+      return;
+    }
+    if (outcome === null) await this.saveConflictCopy(path, remoteText);
+    // The session now builds on the server's version: that is the base of the next write.
+    await this.deps.localIndex.put({
+      fileId: item.id,
+      localPath: path,
+      lastKnownVersion: item.version,
+      lastContentHashBlinded: remoteHash,
+      lastSyncedAt: new Date().toISOString(),
+    });
+    await this.rememberBase(item.id, path, remoteBytes, remoteHash);
+    this.bumpGlobalVersion(item.version);
+    if (outcome !== null) this.deps.log?.add({ kind: "merged", path });
+    // The editor saves the session's text a moment later; then it is compared with the server's version and sent.
+    this.handleLocalEvent("modify", file);
   }
 
   /** Remembers the text of a small note as the merge base for its next conflict (best effort - merging just stays off without it). */
@@ -1200,7 +1323,7 @@ export class SyncEngine {
     if (localText === null || remoteText === null) return "none";
 
     const base = lastHash ? await this.deps.localIndex.getBase(item.id).catch(() => undefined) : undefined;
-    const merged = base && base.hash === lastHash ? merge3(base.text, localText, remoteText) : null;
+    const merged = base && base.hash === lastHash ? merge3(base.text, localText, remoteText) : containingText(localText, remoteText);
 
     if (merged === null) {
       await this.saveConflictCopy(path, remoteWins ? localText : remoteText);
@@ -1209,12 +1332,12 @@ export class SyncEngine {
     if (merged === remoteText) {
       await this.downloadFile(item, path, "newer");
     } else if (merged === localText) {
-      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: await this.deps.crypto.hashContent(localBytes) }, "newer");
+      await this.uploadFile(localFile, item.id, { plaintext: localBytes, hash: await this.deps.crypto.hashContent(localBytes) }, "newer", toBase64(item.contentHashBlinded));
     } else {
       const bytes = textEncoder.encode(merged);
       await this.deps.fs.writeBinary(path, bytes);
       const file = this.deps.fs.getFileByPath(path) ?? localFile;
-      await this.uploadFile(file, item.id, { plaintext: bytes, hash: await this.deps.crypto.hashContent(bytes) }, "newer");
+      await this.uploadFile(file, item.id, { plaintext: bytes, hash: await this.deps.crypto.hashContent(bytes) }, "newer", toBase64(item.contentHashBlinded));
       new Notice(t("merge.merged", { path }), 8000);
       this.deps.log?.add({ kind: "merged", path });
     }
@@ -1243,27 +1366,31 @@ export class SyncEngine {
 
   /**
    * A file was deleted on the server but still exists here. If it is exactly what was synced last, nobody edited it, so
-   * the delete is the only change and must win - whatever the timestamps say (a re-downloaded file has a fresh mtime and
-   * device clocks differ; going by time alone brought deleted folders back). Only a local edit made after the last sync
-   * is weighed against the delete by timestamp.
+   * the delete is the only change and wins - whatever the timestamps say (a re-downloaded file has a fresh mtime and
+   * device clocks differ). A file edited here after the last sync always beats the delete: that edit exists nowhere else
+   * and deleting it would lose it for good, while bringing the file back loses nothing (it can simply be deleted again).
    */
-  private async remoteDeleteWins(record: LocalIndexRecord, localFile: TFile, remoteUpdatedAt: string): Promise<boolean> {
+  private async remoteDeleteWins(record: LocalIndexRecord, localFile: TFile): Promise<boolean> {
     const localBytes = await this.readLocal(localFile);
     if (!localBytes) return true; // gone here as well: nothing to weigh
-    const localHash = toBase64(await this.deps.crypto.hashContent(localBytes));
-    if (localHash === record.lastContentHashBlinded) return true;
-    return this.isRemoteNewer(remoteUpdatedAt, this.deps.fs.getMtime(localFile));
+    return toBase64(await this.deps.crypto.hashContent(localBytes)) === record.lastContentHashBlinded;
   }
 
   private isRemoteNewer(remoteUpdatedAt: string, localMtimeMs: number): boolean {
     return new Date(remoteUpdatedAt).getTime() >= localMtimeMs;
   }
 
+  /**
+   * `base`: the content (blinded hash) this write changes - what this device last had in common with the server for the
+   * file, or null for a new file. If another device wrote in between, the server refuses the write and the two versions
+   * are combined like any other conflict (`resolveStaleWrite`) instead of this one silently replacing the other.
+   */
   private async uploadFile(
     file: TFile,
     fileId: string,
-    precomputed?: { plaintext: Uint8Array; hash: Uint8Array },
-    why?: LogReason,
+    precomputed: { plaintext: Uint8Array; hash: Uint8Array } | undefined,
+    why: LogReason | undefined,
+    base: string | null,
   ): Promise<void> {
     if (Platform.isMobile && file.stat.size > this.mobileLimit()) {
       this.deps.transfers?.fail(file.path, t("p.fail.tooBigMobile", { size: formatBytes(file.stat.size) }));
@@ -1286,9 +1413,10 @@ export class SyncEngine {
     const transferPath = file.path;
     const startedAt = Date.now();
     this.deps.transfers?.begin(transferPath);
-    let result: { version: number };
-    let hash: Uint8Array;
-    let uploadedPlaintext: Uint8Array;
+    let result: { version: number } | undefined;
+    let hash: Uint8Array | undefined;
+    let uploadedPlaintext: Uint8Array | undefined;
+    let stale: DecodedFileListItem | null = null;
     try {
       const plaintext = precomputed?.plaintext ?? (await this.readLocal(file));
       if (!plaintext) return; // deleted while it was being read
@@ -1308,6 +1436,7 @@ export class SyncEngine {
           contentIv: encryptedContent.iv,
           contentCiphertext: encryptedContent.ciphertext,
           editSessionId: this.touchEditSession(fileId),
+          baseHash: base,
         },
         (loaded, total) => this.deps.transfers?.progress(transferPath, loaded, total),
         // A large file goes up in chunks: deleting it meanwhile ends the upload instead of sending the rest.
@@ -1316,12 +1445,18 @@ export class SyncEngine {
     } catch (err) {
       // Deleted on purpose while it was on its way (or gone before it could be read): nothing to report.
       if (err instanceof TransferCancelled || !this.deps.fs.getFileByPath(file.path)) return;
+      stale = staleBaseItem(err);
       // A refused upload must not abort the whole sync run (the other files still have to go through).
-      if (this.handleRefusedUpload(err, file)) return;
-      throw err;
+      if (!stale && this.handleRefusedUpload(err, file)) return;
+      if (!stale) throw err;
     } finally {
       this.deps.transfers?.end(transferPath);
     }
+    if (stale) {
+      await this.resolveStaleWrite(file, stale);
+      return;
+    }
+    if (!result || !hash || !uploadedPlaintext) return;
 
     const record: LocalIndexRecord = {
       fileId,
@@ -1340,6 +1475,22 @@ export class SyncEngine {
     }
     this.deps.log?.add({ kind: "up", path: file.path, why, args: [uploadedPlaintext.byteLength] });
     await this.rememberBase(fileId, file.path, uploadedPlaintext, toBase64(hash));
+  }
+
+  /**
+   * The server refused a write because another device changed the file after the content it was based on (409). The
+   * server's version and this one are then compared and combined exactly like in a sync (merge, or keep the losing side
+   * as a copy). Should that be refused again (yet another write in between), the file is simply tried again later.
+   */
+  private async resolveStaleWrite(file: TFile, current: DecodedFileListItem): Promise<void> {
+    if (this.resolvingStale.has(current.id)) throw new Error(t("p.fail.changedMeanwhile"));
+    this.resolvingStale.add(current.id);
+    try {
+      const local = this.deps.fs.getFileByPath(file.path);
+      if (local) await this.reconcileExisting(current, file.path, local);
+    } finally {
+      this.resolvingStale.delete(current.id);
+    }
   }
 
   /**
@@ -1458,6 +1609,18 @@ export class SyncEngine {
       globalVersion: this.currentGlobalVersion,
     });
   }
+}
+
+/**
+ * Two versions of a note without a known common ancestor (e.g. the same daily note created on two devices before they
+ * synced): when one of them contains the other completely (the template on one side, the filled-in note on the other),
+ * the fuller one loses nothing of either and is taken. Null otherwise.
+ */
+function containingText(a: string, b: string): string | null {
+  const core = (text: string) => text.trim();
+  if (core(b).includes(core(a))) return b;
+  if (core(a).includes(core(b))) return a;
+  return null;
 }
 
 /** `"a/b/c"` -> `"a/b"`, `""` at the top level. */

@@ -52,6 +52,23 @@ describe("merge3", () => {
     expect(merge3(base, local, remote)).toBe(lines("# Title", "", "one", "two", "four", "FIVE", ""));
   });
 
+  it("combines edits of neighbouring lines (ticked task and the line below)", () => {
+    const b = lines("- [ ] one", "- [ ] two", "- [ ] three");
+    expect(merge3(b, lines("- [ ] one", "- [x] two", "- [ ] three"), lines("- [ ] one", "- [ ] two", "- [x] three"))).toBe(
+      lines("- [ ] one", "- [x] two", "- [x] three"),
+    );
+  });
+
+  it("accepts the same edit made on both sides next to another edit", () => {
+    expect(merge3(lines("a", "b", "c", "d", "e"), lines("a", "B", "c", "d", "e+"), lines("A", "B", "c", "d", "e"))).toBe(lines("A", "B", "c", "d", "e+"));
+  });
+
+  it("ignores Windows line endings (CRLF) on one side", () => {
+    const b = lines("- [ ] one", "- [ ] two", "", "Notes:");
+    const remote = "- [ ] one\r\n- [x] two\r\n\r\nNotes:";
+    expect(merge3(b, lines("- [ ] one", "- [ ] two", "", "Notes: more"), remote)).toBe(lines("- [ ] one", "- [x] two", "", "Notes: more"));
+  });
+
   it("handles an empty base (note created on both devices)", () => {
     expect(merge3("", "hello", "world")).toBeNull();
     expect(merge3("", "same", "same")).toBe("same");
