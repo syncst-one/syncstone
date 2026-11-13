@@ -1083,6 +1083,23 @@ export class SyncEngine {
 
     const localFile = this.deps.fs.getFileByPath(path);
     if (!localFile) {
+      // The note may be here written with other upper/lower case (made here and not sent yet, for example): then it is
+      // the same note, compared and merged, never overwritten.
+      const twin = this.deps.fs.getFileByPathIgnoringCase(path);
+      if (twin) {
+        const owner = await this.deps.localIndex.getByPath(twin.path);
+        if (owner && owner.fileId !== item.id) {
+          const placedAt = await this.settleCaseClash(item, record, path, owner, twin);
+          if (!this.deps.fs.getFileByPath(placedAt)) await this.downloadFile(item, placedAt, "new");
+          return;
+        }
+        await this.reconcileExisting(item, twin.path, twin);
+        const current = await this.deps.localIndex.get(item.id);
+        if (current?.localPath === twin.path && twin.path !== path && (await this.moveLocal(twin.path, path))) {
+          await this.deps.localIndex.put({ ...current, localPath: path });
+        }
+        return;
+      }
       await this.downloadFile(item, path, record ? "restored" : "new");
       return;
     }

@@ -153,6 +153,10 @@ export class FileSystemAdapter {
       await this.app.vault.modifyBinary(existing, arrayBuffer);
       return;
     }
+    // Never written through to another file whose name differs only in upper/lower case: on Mac, Windows, iPhone and
+    // iPad that is the same file on disk, and its content would be replaced without anybody noticing.
+    const twin = this.getFileByPathIgnoringCase(normalized);
+    if (twin) throw new Error(`Syncstone: "${normalized}" exists here as "${twin.path}" - not overwritten.`);
     await this.ensureParentFolder(normalized);
     try {
       await this.app.vault.createBinary(normalized, arrayBuffer);
