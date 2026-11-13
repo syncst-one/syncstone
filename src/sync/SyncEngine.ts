@@ -381,8 +381,13 @@ export class SyncEngine {
       try {
         await this.processLocalRename(from, newPath);
       } catch (err) {
-        this.pendingRenames.set(newPath, from); // tried again with the next sync or the debounce
-        throw err;
+        // Offline or the server is down: tried again with the next sync. Refused for this file (deleted elsewhere, for
+        // example): dropped, so it can never hold up the sync; the sync then settles the file like any other.
+        if (isFatal(err)) {
+          this.pendingRenames.set(newPath, from);
+          throw err;
+        }
+        this.logError(err, newPath);
       }
     }
   }
@@ -392,7 +397,17 @@ export class SyncEngine {
     const from = this.pendingRenames.get(path);
     if (from !== undefined) {
       this.pendingRenames.delete(path);
-      if (from !== path) await this.processLocalRename(from, path);
+      if (from !== path) {
+        try {
+          await this.processLocalRename(from, path);
+        } catch (err) {
+          if (isFatal(err)) {
+            this.pendingRenames.set(path, from); // offline: sent with the next sync
+            throw err;
+          }
+          this.logError(err, path); // refused for this file: the edit still goes out, the sync settles the rest
+        }
+      }
     }
     await action();
   }
