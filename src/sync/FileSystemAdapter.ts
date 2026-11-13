@@ -52,6 +52,43 @@ export class FileSystemAdapter {
     return file instanceof TFile ? file : null;
   }
 
+  /** Lower-cased path -> file, for `getFileByPathIgnoringCase`. Built on first use, then kept up to date by `trackCase`. */
+  private caseIndex: Map<string, TFile> | null = null;
+
+  /**
+   * The file at `path` or at the same path written with other upper/lower case letters. Obsidian never has two notes
+   * whose names differ only in case (on no device), and Mac, Windows, iPhone and iPad cannot even store them; so for the
+   * sync "test.md" and "Test.md" are the same place.
+   */
+  getFileByPathIgnoringCase(path: string): TFile | null {
+    const exact = this.getFileByPath(path);
+    if (exact) return exact;
+    const key = normalizePath(path).toLowerCase();
+    if (!this.caseIndex) this.rebuildCaseIndex();
+    let hit = this.caseIndex?.get(key) ?? null;
+    if (hit && this.app.vault.getAbstractFileByPath(hit.path) !== hit) {
+      this.rebuildCaseIndex(); // moved or deleted without an event reaching us: look again
+      hit = this.caseIndex?.get(key) ?? null;
+    }
+    return hit && hit.path.toLowerCase() === key ? hit : null;
+  }
+
+  /** Keeps the lookup of `getFileByPathIgnoringCase` current; fed with the vault's create/delete/rename events. */
+  trackCase(type: "create" | "delete" | "rename", file: TFile, oldPath?: string): void {
+    if (!this.caseIndex) return; // built on first use
+    if (oldPath !== undefined || type === "delete") {
+      const old = (oldPath ?? file.path).toLowerCase();
+      if (this.caseIndex.get(old) === file) this.caseIndex.delete(old);
+    }
+    if (type !== "delete") this.caseIndex.set(file.path.toLowerCase(), file);
+  }
+
+  private rebuildCaseIndex(): void {
+    const index = new Map<string, TFile>();
+    for (const file of this.app.vault.getFiles()) index.set(file.path.toLowerCase(), file);
+    this.caseIndex = index;
+  }
+
   exists(path: string): boolean {
     return this.getFileByPath(path) !== null;
   }

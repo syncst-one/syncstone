@@ -133,6 +133,11 @@ async function doRequest(serverUrl: string, options: RequestOptions): Promise<Ra
   } else if (options.raw) {
     headers["Content-Type"] = "application/octet-stream";
     body = toArrayBuffer(options.raw);
+  } else if ((options.method ?? "GET") !== "GET") {
+    // A request without a body (deleting a file, for example): Obsidian on Android would send it with the content type
+    // of an empty form, which a server may refuse (415). An empty JSON object says clearly that there is nothing in it.
+    headers["Content-Type"] = "application/json";
+    body = "{}";
   }
 
   try {

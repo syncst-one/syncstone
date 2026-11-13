@@ -3,7 +3,6 @@ import type { MessageKey } from "./en";
 export const de: Partial<Record<MessageKey, string>> = {
   "merge.merged": "Syncstone: Änderungen an „{path}“ von zwei Geräten wurden zusammengeführt.",
   "merge.conflictCopy": "Syncstone: „{path}“ wurde auf zwei Geräten unterschiedlich geändert. Die neuere Version wurde übernommen, die andere als „{copy}“ gesichert.",
-  "merge.conflictStamp": "Konflikt",
   "session.ended": "Syncstone: Dieses Gerät wurde von deinem Konto abgemeldet. Melde dich in den Syncstone-Einstellungen erneut an, um weiter zu synchronisieren.",
   "history.action.create": "Erstellt",
   "history.action.modify": "Bearbeitet",

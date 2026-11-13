@@ -2,7 +2,6 @@
 export const en = {
   "merge.merged": "Syncstone: Changes to \"{path}\" from two devices were merged.",
   "merge.conflictCopy": "Syncstone: \"{path}\" was changed differently on two devices. The newer version was kept; the other one was saved as \"{copy}\".",
-  "merge.conflictStamp": "conflict",
   "session.ended": "Syncstone: This device was signed out of your account. Sign in again in the Syncstone settings to keep syncing.",
   "history.action.create": "Created",
   "history.action.modify": "Edited",

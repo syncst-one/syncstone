@@ -75,6 +75,11 @@ export interface SyncEngineDeps {
    */
   isCollabWriter?: (fileId: string) => boolean;
   /**
+   * Saves what is typed in an open editor of `path` to the file right now (Obsidian saves a moment after typing).
+   * True when the note was open. Used before a download replaces the file, so nothing typed just then is lost.
+   */
+  saveOpenEditor?: (path: string) => Promise<boolean>;
+  /**
    * Merges another device's version (`remote`, changed from `base`) into the live session of `fileId`, right in this
    * device's editor (the host's), so every device in the note gets it at once - with what is being typed this very
    * moment kept. Used when a device that is not in the session changed the note. Returns the session's new text, null
@@ -349,6 +354,7 @@ export class SyncEngine {
   }
 
   handleLocalEvent(type: LocalEventType, file: TAbstractFile): void {
+    if (file instanceof TFile && type !== "modify") this.deps.fs.trackCase(type, file);
     if (this.deps.isPaused()) return;
     if (file instanceof TFolder) {
       if (type === "modify" || file.isRoot() || isHiddenFolder(file.path)) return;
@@ -413,6 +419,7 @@ export class SyncEngine {
   }
 
   handleLocalRename(file: TAbstractFile, oldPath: string): void {
+    if (file instanceof TFile) this.deps.fs.trackCase("rename", file, oldPath);
     if (this.deps.isPaused()) return;
     if (file instanceof TFolder) {
       if (file.isRoot() || isHiddenFolder(file.path)) return;
@@ -742,17 +749,39 @@ export class SyncEngine {
       }
       if (this.deps.isConfigPath(path) || handledPaths.has(path)) continue;
 
-      await this.attempt(item.id, path, () =>
-        this.withFileLock(item.id, async () => {
-          const localFile = localByPath.get(path);
-          if (localFile) {
-            await this.reconcileExisting(item, path, localFile);
+      let placedAt = path;
+      let localTwinPath: string | null = null;
+      await this.attempt(item.id, path, async () => {
+        // A note of the same name here (also written with other upper/lower case) is the same note: compared and merged.
+        const twin = localByPath.get(path) ?? this.deps.fs.getFileByPathIgnoringCase(path);
+        const owner = twin && twin.path !== path ? await this.deps.localIndex.getByPath(twin.path) : undefined;
+        if (twin && owner && owner.fileId !== item.id) {
+          // ...unless it is another file of the vault: two names that differ only in case cannot live side by side.
+          await this.withFileLock(item.id, async () => {
+            placedAt = await this.settleCaseClash(item, undefined, path, owner, twin);
+            if (!this.deps.fs.getFileByPath(placedAt)) await this.downloadFile(item, placedAt, "new");
+          });
+          return;
+        }
+        await this.withFileLock(item.id, async () => {
+          if (twin) {
+            placedAt = twin.path;
+            localTwinPath = twin.path;
+            await this.reconcileExisting(item, twin.path, twin);
+            // Written with other upper/lower case here: takes the server's name, like on the other devices.
+            const record = await this.deps.localIndex.get(item.id);
+            if (twin.path !== path && record?.localPath === twin.path && (await this.moveLocal(twin.path, path))) {
+              await this.deps.localIndex.put({ ...record, localPath: path });
+              placedAt = path;
+            }
           } else {
             await this.downloadFile(item, path, "new");
           }
-        }),
-      );
+        });
+      });
       handledPaths.add(path);
+      handledPaths.add(placedAt);
+      if (localTwinPath) handledPaths.add(localTwinPath); // the same file under the name it had before
     }
 
     // --- Phase C ---
@@ -907,6 +936,19 @@ export class SyncEngine {
           await this.deleteRemote(record);
         } else {
           await this.downloadFile(remoteItem, path);
+        }
+        return;
+      }
+      const twin = this.deps.fs.getFileByPathIgnoringCase(path);
+      if (twin) {
+        // The name is there written with other upper/lower case: not deleted. Two different files that differ only in
+        // case cannot live side by side here; `placeLocally` settles that on the next run (one becomes a conflict copy).
+        const owner = await this.deps.localIndex.getByPath(twin.path);
+        if (!owner || owner.fileId === record.fileId) {
+          await this.deps.localIndex.put({ ...record, localPath: twin.path });
+          await this.reconcileExisting(remoteItem, twin.path, twin);
+        } else {
+          await this.settleCaseClash(remoteItem, record, path, owner, twin);
         }
         return;
       }
@@ -1069,6 +1111,13 @@ export class SyncEngine {
     const from = record && record.localPath !== serverPath ? record.localPath : null;
     const haveLocalCopy = from !== null && (await this.isOurs(from, item.id)) && (await this.deps.fs.existsOnDisk(from));
 
+    // Another file of the vault already has this name written with other upper/lower case.
+    const twin = this.deps.fs.getFileByPathIgnoringCase(serverPath);
+    if (twin && twin.path !== serverPath && !(from !== null && twin.path.toLowerCase() === from.toLowerCase())) {
+      const owner = await this.deps.localIndex.getByPath(twin.path);
+      if (owner && owner.fileId !== item.id) return this.settleCaseClash(item, record, serverPath, owner, twin);
+    }
+
     if (await this.isFreeFor(serverPath, item)) {
       if (!haveLocalCopy || !record || from === null) return serverPath;
       if (await this.moveLocal(from, serverPath)) {
@@ -1113,6 +1162,9 @@ export class SyncEngine {
 
   /** True if nothing at `path` stands for a file other than `item` (nothing there, or it is `item` itself). */
   private async isFreeFor(path: string, item: DecodedFileListItem): Promise<boolean> {
+    // The file's own place, maybe written with other upper/lower case: free (a rename that only changes the case).
+    const own = await this.deps.localIndex.get(item.id);
+    if (own && own.localPath.toLowerCase() === path.toLowerCase()) return true;
     if (!(await this.deps.fs.existsOnDisk(path))) return true;
     const owners = await this.deps.localIndex.getAllByPath(path);
     if (owners.length > 0) return owners.every((owner) => owner.fileId === item.id);
@@ -1153,6 +1205,58 @@ export class SyncEngine {
       // Not fatal: this device keeps its name for now, and the next full sync reports it again.
       console.warn(`Syncstone: neuer Name "${path}" konnte nicht an den Server gemeldet werden`, err);
     }
+  }
+
+  /**
+   * Two files of the vault whose names differ only in upper/lower case (made on a device that allows that, or before
+   * this check existed). Obsidian cannot have both under that name, so one of them becomes a conflict copy on every
+   * device. Which one is decided the same way everywhere (the one with the greater id), so all devices agree.
+   * Returns where `item` lives here now.
+   */
+  private async settleCaseClash(
+    item: DecodedFileListItem,
+    record: LocalIndexRecord | undefined,
+    serverPath: string,
+    owner: LocalIndexRecord,
+    twin: TFile,
+  ): Promise<string> {
+    if (item.id > owner.fileId) {
+      // This one moves aside: fetched (or kept) under a conflict name, and every device is told that name.
+      const alternative = await this.conflictPathFor(serverPath);
+      const ownCopy = record && record.localPath !== twin.path ? this.deps.fs.getFileByPath(record.localPath) : null;
+      if (ownCopy && (await this.moveLocal(ownCopy.path, alternative))) {
+        await this.deps.localIndex.put({ ...(record as LocalIndexRecord), localPath: alternative });
+      } else {
+        await this.downloadFile(item, alternative, "new");
+      }
+      await this.renameRemote(item.id, alternative);
+      this.deps.log?.add({ kind: "conflict", path: serverPath, args: [alternative] });
+      return alternative;
+    }
+    // The other one moves aside, this one takes the name.
+    await this.withFileLock(owner.fileId, async () => {
+      const alternative = await this.conflictPathFor(twin.path);
+      if (await this.moveLocal(twin.path, alternative)) {
+        await this.deps.localIndex.put({ ...owner, localPath: alternative });
+        await this.renameRemote(owner.fileId, alternative);
+        this.deps.log?.add({ kind: "conflict", path: twin.path, args: [alternative] });
+      }
+    });
+    return serverPath;
+  }
+
+  /** `Folder/Note.md` -> `Folder/Note (conflict 2026-11-13 21-04).md`, the first such name that is free here. */
+  private async conflictPathFor(path: string): Promise<string> {
+    const slash = path.lastIndexOf("/");
+    const dot = path.lastIndexOf(".");
+    const base = dot > slash + 1 ? path.slice(0, dot) : path;
+    const ext = path.slice(base.length);
+    const stamp = conflictStamp();
+    let candidate = `${base} (conflict ${stamp})${ext}`;
+    for (let counter = 2; (await this.deps.fs.existsOnDisk(candidate)) || this.deps.fs.getFileByPathIgnoringCase(candidate); counter++) {
+      candidate = `${base} (conflict ${stamp} ${counter})${ext}`;
+    }
+    return candidate;
   }
 
   /** `Folder/Note.md` -> `Folder/Note 2.md` (the first name that is free here). */
@@ -1219,7 +1323,7 @@ export class SyncEngine {
    * sync (`LocalIndex` keeps it), see `tryMerge`. Only when that cannot combine the edits does the newer side win -
    * and the other one is then saved as a conflict copy next to the note instead of being thrown away.
    */
-  private async reconcileExisting(item: DecodedFileListItem, path: string, localFile: TFile): Promise<void> {
+  private async reconcileExisting(item: DecodedFileListItem, path: string, localFile: TFile, rechecked = false): Promise<void> {
     const localBytes = await this.readLocal(localFile);
     if (!localBytes) return; // deleted while the sync was busy: the delete event takes care of it
     const localHash = await this.deps.crypto.hashContent(localBytes);
@@ -1264,6 +1368,15 @@ export class SyncEngine {
 
     if (remoteWins) {
       if (live) return; // the live session already carries this content
+      // The note may be open with typing that is not saved yet: saved first, and if that changed it, compared again
+      // (merged or kept as a copy) instead of overwritten.
+      if (!rechecked && (await this.deps.saveOpenEditor?.(path))) {
+        const now = await this.readLocal(localFile);
+        if (now && toBase64(await this.deps.crypto.hashContent(now)) !== localHashBase64) {
+          await this.reconcileExisting(item, path, localFile, true);
+          return;
+        }
+      }
       // Both sides changed and this device's version loses: it must not just vanish. (A losing server version stays in
       // the version history; a losing local one exists nowhere else.) Notes that could be merged were handled above;
       // this covers everything else - images, PDFs, notes too large or not readable as text.
@@ -1401,10 +1514,10 @@ export class SyncEngine {
     const dot = path.lastIndexOf(".");
     const base = dot > slash + 1 ? path.slice(0, dot) : path;
     const ext = path.slice(base.length);
-    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "-");
-    let candidate = `${base} (${t("merge.conflictStamp")} ${stamp})${ext}`;
-    for (let counter = 2; (await this.deps.fs.existsOnDisk(candidate)); counter++) {
-      candidate = `${base} (${t("merge.conflictStamp")} ${stamp} ${counter})${ext}`;
+    const stamp = conflictStamp();
+    let candidate = `${base} (conflict ${stamp})${ext}`;
+    for (let counter = 2; await this.deps.fs.existsOnDisk(candidate); counter++) {
+      candidate = `${base} (conflict ${stamp} ${counter})${ext}`;
     }
     try {
       await this.deps.fs.writeBinary(candidate, typeof content === "string" ? textEncoder.encode(content) : content);
@@ -1672,6 +1785,12 @@ function containingText(a: string, b: string): string | null {
   if (core(b).includes(core(a))) return b;
   if (core(a).includes(core(b))) return a;
   return null;
+}
+
+/** Local date and time for conflict copies: `2026-11-13 21-04` (no colon, it is not allowed in file names everywhere). */
+export function conflictStamp(date = new Date()): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}-${pad(date.getMinutes())}`;
 }
 
 /** `"a/b/c"` -> `"a/b"`, `""` at the top level. */

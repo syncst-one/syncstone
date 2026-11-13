@@ -13,6 +13,7 @@ import {
 import type { CryptoService } from "../sync/CryptoService.js";
 import type { SyncLog } from "../sync/SyncLog.js";
 import { CollabSession } from "./CollabSession.js";
+import { conflictStamp } from "../sync/SyncEngine.js";
 import { bindEditor, canBind, createCollabExtension, getEditorView, replaceEditorText, unbindEditor } from "./editorBinding.js";
 import { CollabKind, openCollabMessage, sealCollabMessage } from "./protocol.js";
 import type { EditorView } from "@codemirror/view";
@@ -651,10 +652,10 @@ export class CollabManager {
   private async saveConflictCopy(room: Room, text: string): Promise<void> {
     const { vault } = this.deps.app;
     const base = room.file.path.replace(/\.md$/i, "");
-    const stamp = new Date().toISOString().slice(0, 16).replace("T", " ").replace(":", "-");
-    let candidate = `${base} (Konflikt ${stamp}).md`;
+    const stamp = conflictStamp();
+    let candidate = `${base} (conflict ${stamp}).md`;
     for (let counter = 2; vault.getAbstractFileByPath(candidate); counter++) {
-      candidate = `${base} (Konflikt ${stamp} ${counter}).md`;
+      candidate = `${base} (conflict ${stamp} ${counter}).md`;
     }
     try {
       await vault.create(candidate, text);

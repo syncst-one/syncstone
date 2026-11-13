@@ -458,6 +458,17 @@ export default class SyncstonePlugin extends Plugin {
       isConfigPath: (path) => this.isConfigPath(path),
       isCollabLive: (fileId) => this.collabManager?.isLive(fileId) ?? false,
       isCollabWriter: (fileId) => this.collabManager?.isWriter(fileId) ?? true,
+      saveOpenEditor: async (path) => {
+        let open = false;
+        for (const leaf of this.app.workspace.getLeavesOfType("markdown")) {
+          const view = leaf.view;
+          if (view instanceof MarkdownView && view.file?.path === path) {
+            open = true;
+            await view.save().catch(() => undefined);
+          }
+        }
+        return open;
+      },
       askAboutMissingFiles: (count) => new Promise((resolve) => new MissingFilesModal(this.app, count, resolve).open()),
       mergeIntoLive: async (fileId, base, remote) => (this.collabManager ? await this.collabManager.mergeIntoLive(fileId, base, remote) : false),
       transfers: this.transfers,
