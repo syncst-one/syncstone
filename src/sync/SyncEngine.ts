@@ -31,6 +31,11 @@ const MAX_FILE_ATTEMPTS = 3;
 const CATCH_UP_FRESH_MS = 15_000;
 /** The same for a file that is new here: a note of the same name may have been created elsewhere a moment ago. */
 const CATCH_UP_NEW_FILE_MS = 1_000;
+/** Files deleted while Syncstone was not running: up to this many go to the other devices without asking. */
+const MAX_SILENT_LOCAL_DELETES = 5;
+
+/** What to do with files that were deleted here while Syncstone was not running (see `doFullSync`). */
+type MissingMode = "delete" | "restore" | "hold";
 
 /** Errors that say "nothing will work right now" (offline, signed out, server down) - those still stop the whole run. */
 function isFatal(err: unknown): boolean {
@@ -85,6 +90,12 @@ export interface SyncEngineDeps {
   onStateChange: (state: { lastSyncAt: string; globalVersion: number }) => void | Promise<void>;
   /** Largest file this device syncs while it is a phone / tablet (default: the safe limit of the shared code). */
   mobileMaxFileBytes?: () => number;
+  /**
+   * More files than `MAX_SILENT_LOCAL_DELETES` were deleted here while Syncstone was not running. Asks whether to delete
+   * them on every device too ("delete") or to bring them back ("restore"); null when the question was closed without an
+   * answer. Without it such files are brought back.
+   */
+  askAboutMissingFiles?: (count: number) => Promise<"delete" | "restore" | null>;
   /** True while the account is read-only (trial / subscription over): uploads are skipped instead of being refused one by one. */
   isReadOnly?: () => boolean;
   /** The server refused a write because the account is read-only (402) or the storage quota is used up (413). */
@@ -169,6 +180,8 @@ export class SyncEngine {
    * first, then the edit.
    */
   private readonly pendingRenames = new Map<string, string>();
+  /** The answer about files deleted while Syncstone was not running: used by the next full sync, then forgotten. */
+  private missingAnswer: "delete" | "restore" | "asking" | "dismissed" | null = null;
   /** Files whose write was refused as outdated and are being merged right now (guards against going round in circles). */
   private readonly resolvingStale = new Set<string>();
 
@@ -652,18 +665,7 @@ export class SyncEngine {
 
     await this.announceFullSyncWork(localByPath, indexRecords, remoteResp.files);
 
-    // Files the index knows but that are gone locally were deleted while the plugin could not see it (app closed, or on
-    // mobile suspended before the debounced delete ran). Those deletes are pushed below - unless so much is missing that
-    // it looks like a broken or moved vault rather than a user action; then the files are restored instead.
-    const tracked = indexRecords.filter((r) => !isMarkerPath(r.localPath) && !this.deps.isConfigPath(r.localPath));
-    const missing = tracked.filter((r) => !localByPath.has(r.localPath)).length;
-    // Deleting by hand while the app is closed is a handful of files; a large share missing at once is a moved, damaged or
-    // re-created folder: then the files come back instead of being deleted on every device.
-    const allowLocalDeletes = missing <= 5 || missing <= tracked.length / 10;
-    if (!allowLocalDeletes) {
-      console.warn(`Syncstone: ${missing} von ${tracked.length} Dateien fehlen lokal - werden wieder heruntergeladen.`);
-      new Notice(t("p.sync.missingLocal", { count: missing }));
-    }
+    const missingMode = this.decideMissingFiles(indexRecords, localByPath, remoteById);
 
     // --- Phase A ---
     // Renames whose new name is still taken by another file of this pass (swapped names) are retried at the end.
@@ -671,7 +673,7 @@ export class SyncEngine {
     for (const record of indexRecords) {
       if (this.disposed) return;
       await this.attempt(record.fileId, record.localPath, () =>
-        this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, allowLocalDeletes, deferred)),
+        this.withFileLock(record.fileId, () => this.reconcileIndexedRecord(record, remoteById, localByPath, handledPaths, missingMode, deferred)),
       );
     }
     if (deferred.length > 0) {
@@ -693,7 +695,7 @@ export class SyncEngine {
         await this.attempt(record.fileId, record.localPath, () =>
           this.withFileLock(record.fileId, async () => {
             const current = await this.deps.localIndex.get(record.fileId);
-            if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, allowLocalDeletes, again);
+            if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, missingMode, again);
           }),
         );
       }
@@ -706,7 +708,7 @@ export class SyncEngine {
       await this.attempt(record.fileId, record.localPath, () =>
         this.withFileLock(record.fileId, async () => {
           const current = await this.deps.localIndex.get(record.fileId);
-          if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, allowLocalDeletes, null);
+          if (current) await this.reconcileIndexedRecord(current, remoteById, localByPath, handledPaths, missingMode, null);
         }),
       );
     }
@@ -758,6 +760,37 @@ export class SyncEngine {
   }
 
   /**
+   * Files the index knows that are gone here were deleted while Syncstone could not see it (app closed, deleted in the
+   * file manager, a phone that suspended the app before the delete was sent). A handful is passed on to the other
+   * devices. More than that may as well be a mishap (a moved folder, files moved out to cloud storage), so the user is
+   * asked; until then those files are left alone (kept on the other devices, not fetched again here). Files changed on
+   * another device meanwhile are not counted: they always come back.
+   */
+  private decideMissingFiles(records: LocalIndexRecord[], localByPath: Map<string, TFile>, remoteById: Map<string, DecodedFileListItem>): MissingMode {
+    const count = records.filter((r) => {
+      if (isMarkerPath(r.localPath) || this.deps.isConfigPath(r.localPath) || localByPath.has(r.localPath)) return false;
+      const remote = remoteById.get(r.fileId);
+      return !!remote && !remote.isDeleted && toBase64(remote.contentHashBlinded) === r.lastContentHashBlinded;
+    }).length;
+    if (count <= MAX_SILENT_LOCAL_DELETES) return "delete";
+    const answer = this.missingAnswer;
+    if (answer === "delete" || answer === "restore") {
+      this.missingAnswer = null;
+      return answer;
+    }
+    if (!this.deps.askAboutMissingFiles) return "restore";
+    if (answer === null) {
+      this.missingAnswer = "asking";
+      void this.deps.askAboutMissingFiles(count).then((choice) => {
+        // Closed without an answer: asked again the next time the app starts.
+        this.missingAnswer = choice ?? "dismissed";
+        if (choice) void this.runFullSync().catch(() => undefined);
+      });
+    }
+    return "hold";
+  }
+
+  /**
    * Tells the explorer rings which files this run will probably move, before the first one starts: they show as empty grey
    * circles and fill one after the other. It is a cheap estimate (no hashing): a file the server has newer than the index
    * remembers, a local file touched after its last sync, a remote file that is missing here, a local file the server does
@@ -799,7 +832,7 @@ export class SyncEngine {
     remoteById: Map<string, DecodedFileListItem>,
     localByPath: Map<string, TFile>,
     handledPaths: Set<string>,
-    allowLocalDeletes: boolean,
+    missingMode: MissingMode,
     deferred: LocalIndexRecord[] | null,
   ): Promise<void> {
     const remoteItem = remoteById.get(record.fileId);
@@ -853,7 +886,9 @@ export class SyncEngine {
       const remoteUnchanged = toBase64(remoteItem.contentHashBlinded) === record.lastContentHashBlinded;
       if (isMarkerPath(path)) {
         // The marker is a dot-file Obsidian never indexes. Its folder being gone means the folder was deleted here.
-        if (allowLocalDeletes && remoteUnchanged && samePath && !(await this.deps.fs.existsOnDisk(parentOf(path)))) {
+        const folderGone = remoteUnchanged && samePath && !(await this.deps.fs.existsOnDisk(parentOf(path)));
+        if (folderGone && missingMode === "hold") return;
+        if (folderGone && missingMode === "delete") {
           await this.deleteRemote(record);
         } else {
           await this.downloadFile(remoteItem, path);
@@ -865,7 +900,8 @@ export class SyncEngine {
         if (!remoteUnchanged) await this.downloadFile(remoteItem, path, "remote");
         return;
       }
-      if (allowLocalDeletes && remoteUnchanged && samePath) {
+      if (remoteUnchanged && samePath && missingMode === "hold") return; // waiting for the answer to the question
+      if (remoteUnchanged && samePath && missingMode === "delete") {
         // Deleted here while the plugin was not running, and nobody changed it since: the delete goes to the server.
         await this.deleteRemote(record);
         return;

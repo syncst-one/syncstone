@@ -27,6 +27,7 @@ import { PublishService } from "./publish/PublishService.js";
 import { PublishModal } from "./ui/PublishModal.js";
 import { SyncLogModal } from "./ui/SyncLogModal.js";
 import { BackupNoticeModal } from "./ui/BackupNoticeModal.js";
+import { MissingFilesModal } from "./ui/MissingFilesModal.js";
 import { ConfigFirstContactModal } from "./ui/ConfigFirstContactModal.js";
 import { previewFirstSync, type FirstSyncPreview } from "./sync/firstSyncPreview.js";
 import { HISTORY_DIFF_VIEW_TYPE, HistoryDiffView } from "./ui/HistoryDiffView.js";
@@ -457,6 +458,7 @@ export default class SyncstonePlugin extends Plugin {
       isConfigPath: (path) => this.isConfigPath(path),
       isCollabLive: (fileId) => this.collabManager?.isLive(fileId) ?? false,
       isCollabWriter: (fileId) => this.collabManager?.isWriter(fileId) ?? true,
+      askAboutMissingFiles: (count) => new Promise((resolve) => new MissingFilesModal(this.app, count, resolve).open()),
       mergeIntoLive: async (fileId, base, remote) => (this.collabManager ? await this.collabManager.mergeIntoLive(fileId, base, remote) : false),
       transfers: this.transfers,
       log: this.syncLog,
